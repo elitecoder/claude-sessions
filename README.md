@@ -1,22 +1,50 @@
 # claude-sessions
 
-A small macOS toolkit for anyone running [Claude Code](https://www.claude.com/product/claude-code) inside [cmux](https://cmux.com):
+**Your 17 Claude Code sessions are not dead. They just look dead.**
 
-- **A browser dashboard** listing every Claude Code session you've ever had, with AI-written titles, last prompt, last reply, and one-click "Resume in new workspace" or "Resume into this existing workspace".
-- **A SessionStart hook** that quietly records which cmux workspace each Claude session is running in, so the dashboard always knows which sessions are live vs. idle.
-- **Two terminal pickers** (`cmux-resume`, `cmux-resume-smart`) for the same job without leaving the shell.
+When [cmux](https://cmux.com) quits, every Claude Code pane dies with it. You relaunch and find yourself staring at an empty sidebar — wondering which session was the bug hunt, which was the refactor, which was the one you were two minutes from finishing.
 
-Built because cmux closes all Claude sessions on quit, and `claude --resume` only resumes the *most recent* session per directory — unusable if you're running five sessions in the same repo at once.
+`claude --resume` won't save you either. It only grabs the most-recent session per directory, which is hilarious if you run five sessions in the same repo at once (hi, monorepo people).
 
-## What the dashboard looks like
+This repo is the small toolkit I built so that never happens again.
 
-- Cards grouped in a responsive grid, dark UI.
-- Each card shows: AI-written title (Claude writes these automatically during a session — we just pick them up), age, message count, `cwd`, kickoff prompt, last user prompt, last assistant reply.
-- **Resume in new workspace** → creates a fresh cmux workspace at the session's original cwd, runs `claude --resume <id>`, renames the workspace to the AI title.
-- **Resume in existing workspace** (via dropdown) → respawns the focused pane of any live workspace you pick, replacing whatever was there. Amber-tinted confirm dialog if that workspace is already running a Claude session.
-- Auto-refreshes every 10s. Countdown pill in the bottom-left, click to refresh now.
+[![macOS](https://img.shields.io/badge/macOS-12%2B-black?logo=apple)](https://www.apple.com/macos/)
+[![Python](https://img.shields.io/badge/python-3.9%2B-blue?logo=python&logoColor=white)](https://www.python.org/)
+[![License](https://img.shields.io/badge/license-Apache%202.0-green)](LICENSE)
+[![Built with](https://img.shields.io/badge/built%20with-Claude%20Code-orange?logo=anthropic)](https://www.claude.com/product/claude-code)
 
-## Install (macOS)
+---
+
+## What you get
+
+![Dashboard](docs/images/dashboard.png)
+
+A browser dashboard at `http://127.0.0.1:18577/` that knows every Claude Code session you've ever run — when you touched it, what it was about, and whether it's alive right now.
+
+Each card shows:
+
+- 🏷  **AI-written title** (Claude Code writes these automatically during a session; we just pick them up)
+- 🕒  Age, message count, working directory
+- 💬  Kickoff prompt · last prompt · last reply — so you can identify sessions at a glance, not just by name
+- 🟢  Green border when the session is live in a cmux workspace
+- 🟨  Amber warning when you're about to do something destructive
+
+## What it does
+
+**Click a card to resume a session. Two modes:**
+
+- `→ New workspace` (default) — spins up a fresh cmux workspace at the session's original cwd, runs `claude --resume <id>`, renames the workspace to the AI title. Done.
+- `→ <existing workspace>` — pick any live workspace from the dropdown. The dashboard respawns that workspace's pane with `claude --resume <id>`. Useful for reclaiming workspaces that drifted away from their original purpose.
+
+If the existing workspace already has a Claude session running, the button turns amber and you get a confirm dialog before it nukes the old one. You don't have to read the code to know when you're about to shoot yourself in the foot.
+
+**Other goodies in the box:**
+
+- `cmux-resume` — a terminal picker, same idea, no browser required.
+- `cmux-resume-smart` — registry-aware: run it in a workspace that already had a session, and it offers to resume that one directly. Ships your shell to the session via `exec`, replacing itself (no new workspace spawned).
+- `cmux-registry.py` — a 60-line Claude `SessionStart` hook that keeps a workspace→session map in `~/.claude/cmux-registry.json`. This is how the dashboard knows what's alive.
+
+## Install
 
 ```bash
 git clone https://github.com/elitecoder/claude-sessions.git
@@ -24,97 +52,94 @@ cd claude-sessions
 ./install.sh
 ```
 
-That's it. The installer:
+The installer:
 
-1. Copies the scripts to `~/.local/bin/`.
-2. Copies the SessionStart hook to `~/.claude/hooks/cmux-registry.py`.
-3. Renders `launchd/com.USER.claude-dashboard.plist.template` into `~/Library/LaunchAgents/com.$USER.claude-dashboard.plist` with your user/home baked in.
-4. Adds one entry to `~/.claude/settings.json` → `hooks.SessionStart[]` (non-destructive; skipped if already present). Backs up settings.json first.
-5. Loads the LaunchAgent so the dashboard starts now *and* auto-starts at login.
-6. Opens `http://127.0.0.1:18577/healthz` to verify.
+1. Copies scripts to `~/.local/bin/` and the hook to `~/.claude/hooks/`.
+2. Renders the LaunchAgent plist with your `$USER` / `$HOME` and drops it into `~/Library/LaunchAgents/`.
+3. Adds one entry to `~/.claude/settings.json → hooks.SessionStart[]` (non-destructive — backs up first, skips if already present).
+4. Boots the daemon so the dashboard starts now AND on every login.
+5. Tells you the URL.
 
-Then open the dashboard:
+**Then:**
 
 ```bash
-claude-dashboard-ctl open
+claude-dashboard-ctl open     # opens http://127.0.0.1:18577/ in your browser
 ```
 
-If `~/.local/bin` isn't on your PATH, the installer prints a hint.
-
-## Requirements
-
-- macOS (for `launchd`; the dashboard itself is cross-platform, but the installer isn't).
-- Python 3 (stdlib only — no pip install).
-- [cmux](https://cmux.com) — technically optional (the dashboard will still render), but Resume buttons need it.
-- [Claude Code](https://www.claude.com/product/claude-code) — these tools work against session files written by Claude Code at `~/.claude/projects/*/*.jsonl`.
-
-## How it works
-
-### The SessionStart hook (`hooks/cmux-registry.py`)
-
-Claude Code fires a `SessionStart` event every time a session starts (both `startup` and `resume` sources). The hook reads Claude's JSON payload from stdin plus a few `CMUX_*` env vars that cmux auto-injects into every pane, and appends one entry per workspace to `~/.claude/cmux-registry.json`:
-
-```json
-{
-  "<cmux-workspace-uuid>": {
-    "session_id": "...",
-    "cwd": "/Users/me/dev/…",
-    "ts": 1778204253
-  }
-}
-```
-
-The hook is idempotent — re-running in the same workspace overwrites the entry. It fails silently if anything goes wrong; hooks must never break Claude itself.
-
-### The dashboard (`bin/claude-dashboard`)
-
-A ~500-line Python stdlib HTTP server on `127.0.0.1:18577`:
-
-- `GET /` — the dashboard HTML (client-side polling, no SSE, no deps).
-- `GET /api/sessions` — returns every session from `~/.claude/projects/*/*.jsonl`, parsed for `ai-title` records, first/last user message, last assistant message, cwd. Cross-referenced with the registry so "active" sessions can be flagged or filtered.
-- `POST /api/resume` — `{session_id, cwd, title, workspace_id?}`. If `workspace_id` is supplied, runs `cmux respawn-pane` against that workspace's terminal surface. Otherwise runs `cmux new-workspace` at the cwd. Either way, renames the workspace to the title and focuses it.
-- `GET /healthz` — `{"ok": true}`.
-
-Nothing listens on the public network — `127.0.0.1` only.
-
-### The launchd agent
-
-Renders from `launchd/com.USER.claude-dashboard.plist.template` at install time. `KeepAlive=true`, `RunAtLoad=true`, `ThrottleInterval=5`. Logs at `~/Library/Logs/claude-dashboard/{out,err}.log`.
-
-### The terminal pickers (`bin/cmux-resume*`)
-
-For when you don't want to open a browser:
-
-- `cmux-resume` — simple picker. Lists recent sessions, you pick a number, runs `claude --resume <id>` in the current terminal via `exec`. Hides sessions currently active in a live cmux workspace (use `--all` to see everything).
-- `cmux-resume-smart` — registry-aware. If you run it from a workspace that already has a registered Claude session, offers to resume that one directly. Falls back to the picker otherwise.
-
-## Configuration
-
-- Port — export `CLAUDE_DASHBOARD_PORT` before running the daemon. (The installer plist hardcodes `18577`; edit the plist or re-run install.sh after changing it.)
-- Max sessions shown in the dashboard — `CLAUDE_DASHBOARD_MAX` (default 60).
-- Everything else is zero-config. No settings file to maintain.
-
-## Uninstall
+### Uninstall
 
 ```bash
 ./uninstall.sh
 ```
 
-Removes the binaries, LaunchAgent, and the hook entry from `settings.json`. Leaves `~/.claude/cmux-registry.json` alone — delete manually if you want.
+Reverses everything. Your session data is untouched — it lives in `~/.claude/projects/`, which is written by Claude Code itself, not by this repo.
 
-## What this does NOT do
+## Requirements
 
-- Does not modify Claude Code's own session files. Read-only.
-- Does not proxy or intercept Claude's network traffic. The dashboard reads JSONL files on disk.
-- Does not start/stop Claude — only cmux workspaces. When you click Resume, cmux runs `claude --resume <id>` as if you'd typed it in a terminal.
-- Does not persist any data beyond `~/.claude/cmux-registry.json` (a simple workspace→session map).
+- **macOS 12+** — for `launchd`. The dashboard binary itself is cross-platform, but the installer and `cmux` aren't.
+- **Python 3.9+** — stdlib only. No `pip install` step.
+- **[cmux](https://cmux.com)** — technically optional (the dashboard still renders without it), but the Resume buttons need it to actually open workspaces.
+- **[Claude Code](https://www.claude.com/product/claude-code)** — the whole point.
 
-## Known quirks
+## How it works (the 5-minute architecture)
 
-- **Pre-existing sessions are not in the registry** until they go through their next `SessionStart` (e.g., via `/clear` or `--resume`). Until then, they'll show as "idle" in the dashboard even if they're actually running. Click Resume anyway — it creates a fresh workspace with the session, and the old one can be closed.
-- **`cmux respawn-pane` is destructive.** If you pick "Resume into <existing workspace>" against a workspace already running a Claude session, that session's process gets killed. The UI warns with amber styling and a confirm dialog, but if you click through: it's gone (the JSONL is still on disk; resume it in a new workspace).
-- **Workspaces with no terminal surface** (e.g., browser-only workspaces) can't be targeted. The API returns an error that surfaces as a red toast in the UI.
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                          cmux workspace                         │
+│  ┌───────────────────────────────────────────────────────────┐  │
+│  │  claude                                                   │  │
+│  │  ├─► writes JSONL: ~/.claude/projects/<cwd>/<sess>.jsonl  │  │
+│  │  │   (kickoff, prompts, replies, ai-title, timestamps)    │  │
+│  │  └─► SessionStart hook fires →                            │  │
+│  │                                                           │  │
+│  │      cmux-registry.py                                     │  │
+│  │      └─► reads $CMUX_WORKSPACE_ID from env                │  │
+│  │          and $sess/$cwd from hook stdin                   │  │
+│  │      └─► writes: ~/.claude/cmux-registry.json             │  │
+│  │          { workspace_id: { session_id, cwd, ts } }        │  │
+│  └───────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  claude-dashboard (launchd-managed, localhost:18577)            │
+│                                                                 │
+│  GET  /            → dashboard HTML (polls every 10s)           │
+│  GET  /api/sessions → reads all JSONLs + the registry,          │
+│                       cross-references them, returns cards      │
+│  POST /api/resume   → shells out to cmux:                       │
+│                       • new-workspace + rename-workspace, OR    │
+│                       • respawn-pane + rename-workspace         │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+Two pieces, no database, no background indexing, no cloud. The registry is a single JSON file. The dashboard reads files on disk on every request (fast enough for <100 sessions — my own use peaks around 60).
+
+## Configuration
+
+All optional:
+
+| Env var                     | Default  | What it does                                     |
+| --------------------------- | -------- | ------------------------------------------------ |
+| `CLAUDE_DASHBOARD_PORT`     | `18577`  | HTTP port. Changes require editing the plist.    |
+| `CLAUDE_DASHBOARD_MAX`      | `60`     | Max sessions shown on the dashboard.             |
+
+## Limitations and sharp edges
+
+I'd rather tell you these up front than let you find them during a bad day.
+
+- **Sessions that started before you installed the hook show as "idle"** even if they're currently running. The hook only fires at `SessionStart`, so older live sessions aren't in the registry. They'll look resumable; clicking Resume will open a fresh workspace with that session. You can then close the original if you want.
+- **`cmux respawn-pane` is destructive.** Picking "Resume into <existing workspace>" kills whatever was running in that workspace's pane. The UI warns you (amber button + confirm dialog), but if you click through, it's gone. (The session's JSONL is still on disk — you can always start over via "New workspace.")
+- **Workspaces with no terminal surface** (browser-only panes) can't be targeted. The API returns an error that the UI surfaces as a red toast.
+- **macOS only** (for the installer). Linux users could probably adapt it with systemd user units — PRs welcome.
+- **No auth.** The server binds to `127.0.0.1` only, so remote access is blocked, but anything that can curl localhost on your machine can control it. If that matters for your threat model, don't install this on shared machines.
+
+## Acknowledgments
+
+- **[cmux](https://cmux.com)** by [@manaflow-ai](https://github.com/manaflow-ai). The whole thing is only possible because cmux exposes a rich CLI/socket API (`list-workspaces`, `new-workspace`, `respawn-pane`, `rename-workspace`). Tip of the hat to the cmux team for building a terminal that's actually automatable.
+- **[Claude Code](https://www.claude.com/product/claude-code)** by [Anthropic](https://www.anthropic.com). The `SessionStart` hook API + the clean JSONL session format made this ~500 lines of Python instead of a weekend project.
+- **Built in a single Claude Code session** with Claude Opus 4.7 (1M context). Yes, really. The session was titled _"Restore Claude sessions after Cmux restart"_ — fittingly, the first thing I did after installing this toolkit was use it to resume that exact conversation.
 
 ## License
 
-Apache 2.0. See `LICENSE`.
+Apache 2.0. See [LICENSE](LICENSE).
