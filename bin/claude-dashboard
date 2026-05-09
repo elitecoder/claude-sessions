@@ -496,17 +496,27 @@ DASHBOARD_HTML = r"""<!doctype html>
   .card.active { border-color: var(--green-dim); background: linear-gradient(180deg, var(--green-fill), transparent 80%), var(--bg-card); }
   .card.is-hidden { opacity: 0.45; filter: saturate(0.5); }
   .card.is-hidden:hover { opacity: 0.75; }
+  .card { position: relative; overflow: visible; }
   .card .hide-btn {
-    position: absolute; top: 10px; right: 10px;
+    position: absolute; top: -9px; right: -9px;
     width: 22px; height: 22px; padding: 0;
     display: flex; align-items: center; justify-content: center;
-    background: transparent; border: 1px solid transparent; border-radius: 50%;
-    color: var(--fg-muted); font-size: 16px; line-height: 1; cursor: pointer;
-    opacity: 0; transition: all 120ms;
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: 50%;
+    color: var(--fg-muted); font-size: 14px; line-height: 1; cursor: pointer;
+    opacity: 0;
+    transform: scale(0.8);
+    transition: opacity 120ms, transform 120ms, color 120ms, border-color 120ms, background 120ms;
+    z-index: 5;
+    box-shadow: 0 4px 10px rgba(0,0,0,0.35);
   }
-  .card { position: relative; }
-  .card:hover .hide-btn { opacity: 1; }
-  .card .hide-btn:hover { color: var(--red); border-color: rgba(247,118,142,0.4); background: rgba(247,118,142,0.08); }
+  .card:hover .hide-btn { opacity: 1; transform: scale(1); }
+  .card .hide-btn:hover {
+    color: var(--red);
+    border-color: var(--red);
+    background: var(--bg-card);
+  }
   .card .title-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
   .card .title {
     font-weight: 600; font-size: 15px; line-height: 1.35; letter-spacing: -0.005em;
