@@ -1,0 +1,13 @@
+# Rendered plist (per-user, not checked in)
+launchd/com.*.claude-dashboard.plist
+
+# Editor / OS
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Python bytecode (there shouldn't be any, but just in case)
+__pycache__/
+*.pyc

@@ -1,0 +1,827 @@
+#!/usr/bin/env python3
+"""
+claude-dashboard — HTTP server that renders a live dashboard of Claude sessions
+and resumes any of them in a newly-created, correctly-named cmux workspace.
+
+Endpoints:
+  GET  /                 → dashboard HTML (cards, client-side polling)
+  GET  /api/sessions     → JSON list of sessions with titles, cwds, previews
+  POST /api/resume       → {session_id} creates a cmux workspace and resumes it
+  GET  /healthz          → ok
+
+Serves on 127.0.0.1:<CLAUDE_DASHBOARD_PORT>  (default 18577).
+"""
+import datetime
+import glob
+import html
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+import traceback
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+PORT = int(os.environ.get("CLAUDE_DASHBOARD_PORT") or os.environ.get("CMUX_DASHBOARD_PORT") or "18577")
+SESSIONS_DIR = os.path.expanduser("~/.claude/projects")
+REGISTRY = os.path.expanduser("~/.claude/cmux-registry.json")
+CMUX = "/Applications/cmux.app/Contents/Resources/bin/cmux"
+HOME = os.path.expanduser("~")
+MAX_SESSIONS = int(os.environ.get("CLAUDE_DASHBOARD_MAX") or os.environ.get("CMUX_DASHBOARD_MAX") or "60")
+
+
+def _extract_user_text(j):
+    if j.get("type") != "user":
+        return None
+    msg = j.get("message", {})
+    c = msg.get("content")
+    if isinstance(c, list):
+        c = " ".join(
+            x.get("text", "") for x in c
+            if isinstance(x, dict) and x.get("type") == "text"
+        )
+    if not isinstance(c, str):
+        return None
+    s = c.strip()
+    if not s or s.startswith("<"):
+        return None
+    return s
+
+
+def _extract_assistant_text(j):
+    if j.get("type") != "assistant":
+        return None
+    c = j.get("message", {}).get("content")
+    if isinstance(c, list):
+        for x in c:
+            if isinstance(x, dict) and x.get("type") == "text":
+                t = x.get("text", "").strip()
+                if t:
+                    return t
+    return None
+
+
+def _condense(text):
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    while lines and (lines[0].startswith("#") or lines[0].lower() in ("## context", "context", "context:")):
+        lines.pop(0)
+    return " ".join(lines)
+
+
+def _strip_code_fences(text):
+    return re.sub(r"```[^`]*```", "[code]", text, flags=re.DOTALL)
+
+
+def parse_session(path):
+    sess = os.path.basename(path)[:-6]
+    cwd = ""
+    ai_title = ""
+    first_user = ""
+    last_user = ""
+    last_assistant = ""
+    last_user_ts = ""
+    n_msgs = 0
+    try:
+        with open(path, "r", errors="replace") as fh:
+            for line in fh:
+                try:
+                    j = json.loads(line)
+                except Exception:
+                    continue
+                n_msgs += 1
+                t = j.get("type")
+                if not cwd and j.get("cwd"):
+                    cwd = j["cwd"]
+                if t == "ai-title":
+                    v = j.get("aiTitle") or j.get("title")
+                    if isinstance(v, str) and v.strip():
+                        ai_title = v.strip()
+                    continue
+                utxt = _extract_user_text(j)
+                if utxt:
+                    if not first_user:
+                        first_user = _condense(utxt)
+                    last_user = _condense(utxt)
+                    ts = j.get("timestamp", "")
+                    if ts:
+                        last_user_ts = ts
+                    continue
+                atxt = _extract_assistant_text(j)
+                if atxt:
+                    last_assistant = _condense(_strip_code_fences(atxt))
+    except Exception:
+        pass
+    return {
+        "sess": sess,
+        "cwd": cwd or "",
+        "ai_title": ai_title,
+        "first_user": first_user,
+        "last_user": last_user,
+        "last_assistant": last_assistant,
+        "last_user_ts": last_user_ts,
+        "mtime": os.path.getmtime(path),
+        "n_msgs": n_msgs,
+    }
+
+
+def humantime(ts):
+    delta = datetime.datetime.now().timestamp() - ts
+    if delta < 60: return f"{int(delta)}s"
+    if delta < 3600: return f"{int(delta/60)}m"
+    if delta < 86400: return f"{int(delta/3600)}h"
+    return f"{int(delta/86400)}d"
+
+
+def shorten_cwd(cwd, width=60):
+    short = cwd.replace(HOME, "~") if cwd.startswith(HOME) else cwd
+    if len(short) > width:
+        short = "…" + short[-(width - 1):]
+    return short
+
+
+def load_registry():
+    try:
+        with open(REGISTRY) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def live_workspaces():
+    try:
+        out = subprocess.run(
+            [CMUX, "--json", "--id-format", "both", "list-workspaces"],
+            capture_output=True, text=True, timeout=2,
+        )
+        if out.returncode != 0 or not out.stdout.strip():
+            return {}
+        data = json.loads(out.stdout)
+        items = data.get("workspaces") if isinstance(data, dict) else data
+        result = {}
+        for w in items or []:
+            wid = w.get("id") or w.get("uuid")
+            if wid:
+                result[wid] = {
+                    "title": w.get("title") or "",
+                    "ref": w.get("ref") or "",
+                    "selected": bool(w.get("selected")),
+                }
+        return result
+    except Exception:
+        return {}
+
+
+def active_session_ids(registry, ws_live):
+    return {
+        entry["session_id"]
+        for ws, entry in registry.items()
+        if ws in ws_live and entry.get("session_id")
+    }
+
+
+def collect_sessions():
+    files = []
+    for p in glob.glob(os.path.join(SESSIONS_DIR, "*", "*.jsonl")):
+        if "/subagents/" in p:
+            continue
+        files.append(p)
+    files.sort(key=os.path.getmtime, reverse=True)
+    files = files[:MAX_SESSIONS]
+    return [parse_session(p) for p in files]
+
+
+def build_payload():
+    sessions = collect_sessions()
+    registry = load_registry()
+    ws_live = live_workspaces()
+    active_ids = active_session_ids(registry, ws_live)
+
+    # session_id -> (workspace_id, workspace_title)
+    sess_to_ws = {}
+    # workspace_id -> session_id (so UI can flag which live workspaces have a Claude running)
+    ws_to_sess = {}
+    for ws, entry in registry.items():
+        if ws in ws_live and entry.get("session_id"):
+            sess_to_ws[entry["session_id"]] = (ws, ws_live[ws]["title"])
+            ws_to_sess[ws] = entry["session_id"]
+
+    # List of live workspaces for the "resume into existing" picker
+    workspaces_list = []
+    for ws_id, info in ws_live.items():
+        workspaces_list.append({
+            "id": ws_id,
+            "ref": info.get("ref", ""),
+            "title": info.get("title", "") or "(untitled)",
+            "selected": info.get("selected", False),
+            "has_claude": ws_id in ws_to_sess,
+        })
+    # Stable sort: selected first, then by ref number
+    def _ref_num(w):
+        m = re.search(r"\d+", w["ref"] or "")
+        return int(m.group()) if m else 9999
+    workspaces_list.sort(key=lambda w: (not w["selected"], _ref_num(w)))
+
+    out = []
+    for s in sessions:
+        title = s["ai_title"] or (s["first_user"][:60] if s["first_user"] else s["sess"][:8])
+        title = title[:90]
+        ws_match = sess_to_ws.get(s["sess"])
+        out.append({
+            "sess": s["sess"],
+            "title": title,
+            "cwd": s["cwd"],
+            "cwd_short": shorten_cwd(s["cwd"] or "(unknown)"),
+            "cwd_exists": bool(s["cwd"]) and os.path.isdir(s["cwd"]),
+            "age": humantime(s["mtime"]),
+            "age_seconds": int(datetime.datetime.now().timestamp() - s["mtime"]),
+            "n_msgs": s["n_msgs"],
+            "kickoff": s["first_user"][:220],
+            "latest_user": s["last_user"][:220],
+            "latest_assistant": s["last_assistant"][:220],
+            "active": s["sess"] in active_ids,
+            "workspace_id": ws_match[0] if ws_match else "",
+            "workspace_title": ws_match[1] if ws_match else "",
+        })
+    return {
+        "generated_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "sessions": out,
+        "workspaces": workspaces_list,
+    }
+
+
+def _sanitize_title(t):
+    t = (t or "").strip()
+    t = re.sub(r"\s+", " ", t)
+    return t[:60] or "Claude session"
+
+
+def _list_ws_refs_set():
+    ws = live_workspaces()
+    return {info.get("ref") for info in ws.values() if info.get("ref")}
+
+
+def resume_in_new_workspace(session_id, cwd, title):
+    """Create a new cmux workspace running `claude --resume <id>`, then rename it.
+    Returns the new workspace ref (e.g. 'workspace:18') or raises."""
+    if not cwd or not os.path.isdir(cwd):
+        raise ValueError(f"cwd not usable: {cwd!r}")
+
+    # Snapshot existing refs so we can detect which ref is new
+    before = _list_ws_refs_set()
+
+    cmd_str = f"claude --resume {shlex.quote(session_id)}"
+    result = subprocess.run(
+        [CMUX, "new-workspace", "--cwd", cwd, "--command", cmd_str],
+        capture_output=True, text=True, timeout=5,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"cmux new-workspace failed: {result.stderr or result.stdout}")
+
+    # Parse 'OK workspace:NN' from stdout; fall back to diffing the workspace list
+    new_ref = ""
+    m = re.search(r"workspace:(\d+)", result.stdout or "")
+    if m:
+        new_ref = f"workspace:{m.group(1)}"
+    else:
+        # Fallback: poll for up to 2s
+        for _ in range(20):
+            after = _list_ws_refs_set()
+            diff = after - before
+            if diff:
+                new_ref = next(iter(diff))
+                break
+            time.sleep(0.1)
+    if not new_ref:
+        raise RuntimeError("created workspace but could not determine its ref")
+
+    # Rename
+    safe_title = _sanitize_title(title)
+    subprocess.run(
+        [CMUX, "rename-workspace", "--workspace", new_ref, "--", safe_title],
+        capture_output=True, text=True, timeout=5,
+    )
+    return new_ref
+
+
+def _find_terminal_surface(workspace_id):
+    """Return (surface_id, surface_ref) of a terminal surface in the given workspace.
+    Prefers the selected surface; falls back to the first terminal surface."""
+    try:
+        out = subprocess.run(
+            [CMUX, "--json", "--id-format", "both", "list-pane-surfaces",
+             "--workspace", workspace_id],
+            capture_output=True, text=True, timeout=3,
+        )
+        if out.returncode != 0:
+            return None, None
+        data = json.loads(out.stdout)
+        surfaces = data.get("surfaces", []) or []
+        terminal_surfaces = [s for s in surfaces if s.get("type") == "terminal"]
+        if not terminal_surfaces:
+            return None, None
+        selected = next((s for s in terminal_surfaces if s.get("selected")), None)
+        chosen = selected or terminal_surfaces[0]
+        return chosen.get("id", ""), chosen.get("ref", "")
+    except Exception:
+        return None, None
+
+
+def resume_in_existing_workspace(session_id, workspace_id, title, rename=True):
+    """Respawn the workspace's terminal surface with `claude --resume <id>`,
+    then optionally rename the workspace. Destructive — replaces pane contents."""
+    if not workspace_id:
+        raise ValueError("workspace_id required")
+
+    surface_id, surface_ref = _find_terminal_surface(workspace_id)
+    if not surface_id:
+        raise RuntimeError("workspace has no terminal surface to respawn into")
+
+    cmd_str = f"claude --resume {shlex.quote(session_id)}"
+    result = subprocess.run(
+        [CMUX, "respawn-pane",
+         "--workspace", workspace_id,
+         "--surface", surface_id,
+         "--command", cmd_str],
+        capture_output=True, text=True, timeout=5,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"cmux respawn-pane failed: {result.stderr or result.stdout}")
+
+    if rename:
+        safe_title = _sanitize_title(title)
+        subprocess.run(
+            [CMUX, "rename-workspace", "--workspace", workspace_id, "--", safe_title],
+            capture_output=True, text=True, timeout=5,
+        )
+
+    # Focus the workspace so the user ends up looking at the new session
+    subprocess.run(
+        [CMUX, "select-workspace", "--workspace", workspace_id],
+        capture_output=True, text=True, timeout=5,
+    )
+    return workspace_id
+
+
+# ---- HTTP ----
+
+DASHBOARD_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Claude sessions</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0b0f14;
+    --bg-elev: #121823;
+    --bg-card: #151d2a;
+    --bg-hover: #1b2436;
+    --border: #1f2a3d;
+    --fg: #e6edf3;
+    --fg-muted: #8ba3c1;
+    --accent: #7aa2f7;
+    --accent-dim: #3d4b6b;
+    --green: #4ade80;
+    --green-dim: rgba(74, 222, 128, 0.35);
+    --green-fill: rgba(74, 222, 128, 0.08);
+    --amber: #e0af68;
+    --red: #f7768e;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; font-family: -apple-system, "SF Pro Text", system-ui, sans-serif; background: var(--bg); color: var(--fg); }
+  header { padding: 24px 32px 12px; display: flex; align-items: baseline; gap: 16px; border-bottom: 1px solid var(--border); }
+  header h1 { font-size: 20px; margin: 0; font-weight: 600; letter-spacing: -0.01em; }
+  header .meta { color: var(--fg-muted); font-size: 13px; margin-left: auto; }
+  main { padding: 20px 32px 40px; display: grid; grid-template-columns: repeat(auto-fill, minmax(420px, 1fr)); gap: 16px; }
+  .card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px 18px;
+    display: flex; flex-direction: column; gap: 10px;
+    transition: border-color 120ms, background 120ms, transform 120ms;
+  }
+  .card:hover { border-color: var(--accent-dim); background: var(--bg-hover); }
+  .card.active { border-color: var(--green-dim); background: linear-gradient(180deg, var(--green-fill), transparent 80%), var(--bg-card); }
+  .card .title-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+  .card .title {
+    font-weight: 600; font-size: 15px; line-height: 1.35; letter-spacing: -0.005em;
+    flex: 1 1 auto; min-width: 0;
+    overflow: hidden; text-overflow: ellipsis;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+    word-break: break-word;
+  }
+  .card .status {
+    font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em;
+    padding: 2px 10px; border-radius: 999px; flex-shrink: 0;
+    background: var(--bg-elev); color: var(--fg-muted); border: 1px solid var(--border);
+    white-space: nowrap;
+  }
+  .card.active .status { color: var(--green); border-color: var(--green-dim); background: var(--green-fill); }
+  .card .meta { font-size: 12px; color: var(--fg-muted); display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+  .card .meta .cwd { font-family: "SF Mono", ui-monospace, monospace; color: var(--fg); opacity: 0.85; }
+  .card .meta .cwd.missing { color: var(--amber); }
+  .card .meta .ws-name {
+    color: var(--green); max-width: 100%;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .card .preview { font-size: 13px; line-height: 1.45; color: var(--fg-muted); }
+  .card .preview b { color: var(--fg); font-weight: 600; margin-right: 6px; }
+  .card .preview p { margin: 0 0 4px; overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+  .card .actions { display: flex; gap: 8px; margin-top: auto; padding-top: 6px; align-items: center; }
+  .card select {
+    font: inherit; font-size: 12px;
+    background: var(--bg-elev); color: var(--fg); border: 1px solid var(--border);
+    border-radius: 6px; padding: 6px 8px; cursor: pointer;
+    max-width: 180px; flex-shrink: 1; min-width: 0;
+  }
+  .card select:hover { border-color: var(--accent-dim); }
+  .card select:focus { outline: none; border-color: var(--accent); }
+  .card button {
+    font: inherit; font-size: 13px; font-weight: 500;
+    padding: 7px 14px; border-radius: 6px; border: 1px solid var(--accent-dim);
+    background: transparent; color: var(--accent); cursor: pointer;
+    transition: background 120ms, border-color 120ms;
+    flex-shrink: 0;
+  }
+  .card button:hover:not(:disabled) { background: rgba(122,162,247,0.1); border-color: var(--accent); }
+  .card button:disabled { opacity: 0.5; cursor: not-allowed; }
+  .card button.primary { background: var(--accent); color: #0b0f14; border-color: var(--accent); font-weight: 600; }
+  .card button.primary:hover:not(:disabled) { background: #94b5f9; }
+  .card button.danger { background: var(--amber); color: #0b0f14; border-color: var(--amber); font-weight: 600; }
+  .card button.danger:hover:not(:disabled) { background: #efc185; }
+  .toast {
+    position: fixed; bottom: 24px; right: 24px;
+    background: var(--bg-elev); border: 1px solid var(--border); padding: 12px 18px; border-radius: 8px;
+    box-shadow: 0 10px 40px rgba(0,0,0,0.4); font-size: 13px;
+    transform: translateY(20px); opacity: 0; transition: all 200ms;
+    z-index: 20;
+  }
+  .toast.visible { transform: translateY(0); opacity: 1; }
+  .toast.error { border-color: var(--red); color: var(--red); }
+  .toast.success { border-color: var(--green); color: var(--green); }
+  .empty { grid-column: 1/-1; padding: 60px 20px; text-align: center; color: var(--fg-muted); }
+
+  .refresh-pill {
+    position: fixed; bottom: 20px; left: 20px;
+    display: flex; align-items: center; gap: 8px;
+    padding: 7px 16px 7px 12px;
+    background: rgba(11, 15, 20, 0.82);
+    backdrop-filter: blur(14px) saturate(140%);
+    -webkit-backdrop-filter: blur(14px) saturate(140%);
+    border: 1px solid rgba(122, 162, 247, 0.28);
+    border-radius: 999px;
+    font-size: 12px; font-weight: 500; color: var(--fg);
+    box-shadow: 0 8px 24px rgba(0,0,0,0.5), 0 0 0 1px rgba(0,0,0,0.3);
+    user-select: none; cursor: pointer;
+    transition: all 150ms;
+    z-index: 10;
+  }
+  .refresh-pill:hover { border-color: var(--accent); background: rgba(17, 24, 35, 0.92); }
+  .refresh-pill.refreshing {
+    color: var(--accent);
+    border-color: var(--accent);
+    box-shadow: 0 8px 24px rgba(0,0,0,0.5), 0 0 16px rgba(122,162,247,0.25);
+  }
+  .refresh-pill .dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--accent);
+    box-shadow: 0 0 8px rgba(122,162,247,0.6);
+    transition: background 150ms, transform 150ms;
+  }
+  .refresh-pill.refreshing .dot {
+    animation: spin 900ms linear infinite;
+    border: 2px solid transparent;
+    border-top-color: var(--accent);
+    background: transparent;
+    box-shadow: none;
+    box-sizing: border-box;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<header>
+  <h1>Claude sessions</h1>
+  <div class="meta">
+    <span id="session-count">—</span> sessions · last refresh <span id="refresh-ts">—</span>
+  </div>
+</header>
+<main id="grid"></main>
+<div class="refresh-pill" id="refresh-pill" title="Click to refresh now">
+  <span class="dot"></span>
+  <span id="refresh-pill-label">Next refresh in 10s</span>
+</div>
+<div class="toast" id="toast"></div>
+<script>
+const grid = document.getElementById('grid');
+const countEl = document.getElementById('session-count');
+const tsEl = document.getElementById('refresh-ts');
+const toast = document.getElementById('toast');
+
+function showToast(msg, kind) {
+  toast.textContent = msg;
+  toast.className = 'toast visible ' + (kind || '');
+  setTimeout(() => { toast.className = 'toast'; }, 3200);
+}
+
+let cachedWorkspaces = [];
+
+function renderCards(data) {
+  countEl.textContent = data.sessions.length;
+  tsEl.textContent = new Date().toLocaleTimeString();
+  cachedWorkspaces = data.workspaces || [];
+  if (!data.sessions.length) {
+    grid.innerHTML = '<div class="empty">No Claude sessions found.</div>';
+    return;
+  }
+  const frag = document.createDocumentFragment();
+  for (const s of data.sessions) {
+    const card = document.createElement('div');
+    card.className = 'card' + (s.active ? ' active' : '');
+    const titleRow = document.createElement('div');
+    titleRow.className = 'title-row';
+    const title = document.createElement('div');
+    title.className = 'title';
+    title.textContent = s.title;
+    titleRow.appendChild(title);
+    const status = document.createElement('span');
+    status.className = 'status';
+    status.textContent = s.active ? 'running' : 'idle';
+    if (s.active && s.workspace_title) status.title = 'Workspace: ' + s.workspace_title;
+    titleRow.appendChild(status);
+    card.appendChild(titleRow);
+
+    const meta = document.createElement('div');
+    meta.className = 'meta';
+    const cwd = document.createElement('span');
+    cwd.className = 'cwd' + (s.cwd_exists ? '' : ' missing');
+    cwd.textContent = s.cwd_short || '(unknown cwd)';
+    meta.appendChild(cwd);
+    const age = document.createElement('span');
+    age.textContent = s.age + ' ago · ' + s.n_msgs + ' msgs';
+    meta.appendChild(age);
+    if (s.active && s.workspace_title) {
+      const ws = document.createElement('span');
+      ws.className = 'ws-name';
+      ws.textContent = '↳ ' + s.workspace_title;
+      ws.title = s.workspace_title;
+      meta.appendChild(ws);
+    }
+    card.appendChild(meta);
+
+    const preview = document.createElement('div');
+    preview.className = 'preview';
+    if (s.kickoff) {
+      const p = document.createElement('p');
+      p.innerHTML = '<b>kickoff</b>' + escapeHtml(s.kickoff);
+      preview.appendChild(p);
+    }
+    if (s.latest_user && s.latest_user !== s.kickoff) {
+      const p = document.createElement('p');
+      p.innerHTML = '<b>last prompt</b>' + escapeHtml(s.latest_user);
+      preview.appendChild(p);
+    }
+    if (s.latest_assistant) {
+      const p = document.createElement('p');
+      p.innerHTML = '<b>last reply</b>' + escapeHtml(s.latest_assistant);
+      preview.appendChild(p);
+    }
+    card.appendChild(preview);
+
+    const actions = document.createElement('div');
+    actions.className = 'actions';
+
+    const select = document.createElement('select');
+    const newOpt = document.createElement('option');
+    newOpt.value = '';
+    newOpt.textContent = '↗ New workspace';
+    select.appendChild(newOpt);
+    for (const w of cachedWorkspaces) {
+      // Don't offer to respawn the workspace where this same session is running (no-op)
+      if (w.id === s.workspace_id) continue;
+      const opt = document.createElement('option');
+      opt.value = w.id;
+      const lbl = w.title.length > 28 ? w.title.slice(0, 27) + '…' : w.title;
+      opt.textContent = (w.has_claude ? '⚠ ' : '→ ') + lbl;
+      opt.title = w.title + (w.has_claude ? ' (has a Claude session — will be replaced)' : '');
+      select.appendChild(opt);
+    }
+    select.disabled = s.active || !s.cwd_exists;
+
+    const btn = document.createElement('button');
+    btn.className = 'primary';
+    btn.disabled = s.active || !s.cwd_exists;
+
+    function updateButton() {
+      if (s.active) { btn.textContent = 'Already running'; return; }
+      if (!s.cwd_exists && !select.value) { btn.textContent = 'cwd missing'; return; }
+      if (!select.value) {
+        btn.textContent = 'Resume in new workspace';
+        btn.className = 'primary';
+      } else {
+        const w = cachedWorkspaces.find(x => x.id === select.value);
+        const titleTxt = w ? w.title : '(workspace)';
+        if (w && w.has_claude) {
+          btn.textContent = '⚠ Replace “' + titleTxt + '”';
+          btn.className = 'danger';
+        } else {
+          btn.textContent = 'Resume in “' + titleTxt + '”';
+          btn.className = 'primary';
+        }
+      }
+    }
+    select.onchange = updateButton;
+    updateButton();
+    btn.onclick = () => resumeSession(s, btn, select.value);
+
+    actions.appendChild(select);
+    actions.appendChild(btn);
+    card.appendChild(actions);
+
+    frag.appendChild(card);
+  }
+  grid.replaceChildren(frag);
+}
+
+function escapeHtml(s) {
+  return (s || '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+async function resumeSession(s, btn, targetWorkspaceId) {
+  if (targetWorkspaceId) {
+    const w = cachedWorkspaces.find(x => x.id === targetWorkspaceId);
+    if (w && w.has_claude) {
+      const ok = confirm(
+        'Workspace “' + w.title + '” already has a Claude session running.\n\n' +
+        'Continuing will kill that pane and replace it with “' + s.title + '”.\n\n' +
+        'Proceed?'
+      );
+      if (!ok) return;
+    }
+  }
+  const prevLabel = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = targetWorkspaceId ? 'Respawning pane…' : 'Creating workspace…';
+  try {
+    const r = await fetch('/api/resume', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        session_id: s.sess,
+        title: s.title,
+        cwd: s.cwd,
+        workspace_id: targetWorkspaceId || '',
+      }),
+    });
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.error || r.statusText);
+    if (data.mode === 'existing') {
+      showToast('Resumed in existing workspace · ' + data.title, 'success');
+      btn.textContent = 'Resumed ·  ' + (data.title || '');
+    } else {
+      showToast('Opened workspace ' + data.workspace_ref + ' · ' + data.title, 'success');
+      btn.textContent = 'Opened · ' + data.workspace_ref;
+    }
+    setTimeout(refresh, 600);
+  } catch (e) {
+    showToast('Resume failed: ' + e.message, 'error');
+    btn.disabled = false;
+    btn.textContent = prevLabel;
+  }
+}
+
+const REFRESH_MS = 10000;
+const pill = document.getElementById('refresh-pill');
+const pillLabel = document.getElementById('refresh-pill-label');
+let lastRefreshAt = 0;
+let refreshInFlight = false;
+
+async function refresh() {
+  if (refreshInFlight) return;
+  refreshInFlight = true;
+  pill.classList.add('refreshing');
+  pillLabel.textContent = 'Refreshing…';
+  try {
+    const r = await fetch('/api/sessions');
+    const data = await r.json();
+    renderCards(data);
+    lastRefreshAt = Date.now();
+  } catch (e) {
+    console.error(e);
+  } finally {
+    refreshInFlight = false;
+    pill.classList.remove('refreshing');
+  }
+}
+
+function tickPill() {
+  if (refreshInFlight) return;
+  const elapsed = Date.now() - lastRefreshAt;
+  const remaining = Math.max(0, Math.ceil((REFRESH_MS - elapsed) / 1000));
+  pillLabel.textContent = remaining > 0 ? `Next refresh in ${remaining}s` : 'Refreshing…';
+}
+
+pill.addEventListener('click', () => refresh());
+
+refresh();
+setInterval(refresh, REFRESH_MS);
+setInterval(tickPill, 250);
+</script>
+</body>
+</html>
+"""
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        # Quiet noisy access log; write errors only
+        if "POST /api/resume" in (fmt % args):
+            sys.stderr.write("[%s] %s\n" % (self.log_date_time_string(), fmt % args))
+
+    def _send_json(self, status, obj):
+        body = json.dumps(obj).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path == "/" or self.path.startswith("/?"):
+            body = DASHBOARD_HTML.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if self.path == "/api/sessions":
+            try:
+                payload = build_payload()
+                self._send_json(200, payload)
+            except Exception as e:
+                traceback.print_exc()
+                self._send_json(500, {"error": str(e)})
+            return
+        if self.path == "/healthz":
+            self._send_json(200, {"ok": True, "port": PORT})
+            return
+        self._send_json(404, {"error": "not found"})
+
+    def do_POST(self):
+        if self.path != "/api/resume":
+            self._send_json(404, {"error": "not found"})
+            return
+        length = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(length) if length else b"{}"
+        try:
+            data = json.loads(body)
+        except Exception:
+            self._send_json(400, {"error": "invalid JSON"})
+            return
+        sid = data.get("session_id")
+        cwd = data.get("cwd")
+        title = data.get("title") or "Claude session"
+        target_ws = data.get("workspace_id") or ""
+        if not sid:
+            self._send_json(400, {"error": "session_id required"})
+            return
+        try:
+            if target_ws:
+                ref = resume_in_existing_workspace(sid, target_ws, title)
+                self._send_json(200, {
+                    "mode": "existing",
+                    "workspace_id": ref,
+                    "title": _sanitize_title(title),
+                })
+            else:
+                if not cwd:
+                    self._send_json(400, {"error": "cwd required for new workspace"})
+                    return
+                ref = resume_in_new_workspace(sid, cwd, title)
+                self._send_json(200, {
+                    "mode": "new",
+                    "workspace_ref": ref,
+                    "title": _sanitize_title(title),
+                })
+        except Exception as e:
+            traceback.print_exc()
+            self._send_json(500, {"error": str(e)})
+
+
+def main():
+    srv = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+    print(f"claude-dashboard listening on http://127.0.0.1:{PORT}", flush=True)
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()

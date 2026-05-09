@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# claude-dashboard-ctl — manage the launchd-backed Claude sessions dashboard daemon.
+#
+# Subcommands:
+#   install   load the LaunchAgent (also starts it)
+#   uninstall unload the LaunchAgent
+#   start     start if not running
+#   stop      stop
+#   restart   stop then start
+#   status    show status + last few log lines
+#   open      open http://127.0.0.1:<port> in browser (starts if needed)
+#   logs      tail -f the stderr log
+
+set -euo pipefail
+
+LABEL="com.${USER}.claude-dashboard"
+PLIST="$HOME/Library/LaunchAgents/${LABEL}.plist"
+PORT="${CLAUDE_DASHBOARD_PORT:-18577}"
+URL="http://127.0.0.1:${PORT}/"
+LOG_DIR="$HOME/Library/Logs/claude-dashboard"
+STDOUT_LOG="${LOG_DIR}/out.log"
+STDERR_LOG="${LOG_DIR}/err.log"
+
+mkdir -p "$LOG_DIR"
+
+cmd="${1:-status}"
+
+case "$cmd" in
+  install)
+    launchctl load "$PLIST" 2>/dev/null || true
+    launchctl bootstrap gui/$(id -u) "$PLIST" 2>/dev/null || true
+    echo "Loaded $LABEL. Waiting a moment for it to bind..."
+    sleep 1
+    curl -sf "${URL}healthz" > /dev/null && echo "Dashboard is up at $URL" || echo "(not responding yet — check: $0 logs)"
+    ;;
+  uninstall)
+    launchctl bootout gui/$(id -u)/$LABEL 2>/dev/null || true
+    launchctl unload "$PLIST" 2>/dev/null || true
+    echo "Unloaded $LABEL"
+    ;;
+  start)
+    launchctl kickstart -k "gui/$(id -u)/$LABEL"
+    echo "Started (or restarted). $URL"
+    ;;
+  stop)
+    launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || launchctl stop "$LABEL"
+    echo "Stopped"
+    ;;
+  restart)
+    launchctl kickstart -k "gui/$(id -u)/$LABEL"
+    echo "Restarted. $URL"
+    ;;
+  status)
+    if launchctl print "gui/$(id -u)/$LABEL" 2>/dev/null | grep -qE "state = (running|waiting)"; then
+      state=$(launchctl print "gui/$(id -u)/$LABEL" 2>/dev/null | awk -F '= ' '/state =/ {print $2; exit}')
+      echo "launchd state: $state"
+    else
+      echo "launchd state: not loaded"
+    fi
+    if curl -sf "${URL}healthz" > /dev/null; then
+      echo "HTTP: healthy at $URL"
+    else
+      echo "HTTP: not responding on $URL"
+    fi
+    echo "---last 5 log lines (stderr):"
+    tail -5 "$STDERR_LOG" 2>/dev/null || echo "(no log yet)"
+    ;;
+  open)
+    if ! curl -sf "${URL}healthz" > /dev/null; then
+      echo "Not running — starting..."
+      launchctl kickstart "gui/$(id -u)/$LABEL" 2>/dev/null || launchctl load "$PLIST" 2>/dev/null || true
+      sleep 1
+    fi
+    open "$URL"
+    ;;
+  logs)
+    echo "Tailing $STDERR_LOG (Ctrl-C to stop)"
+    tail -f "$STDERR_LOG" 2>/dev/null
+    ;;
+  *)
+    echo "Usage: $0 {install|uninstall|start|stop|restart|status|open|logs}"
+    exit 2
+    ;;
+esac

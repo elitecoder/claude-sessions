@@ -1,0 +1,296 @@
+#!/usr/bin/env python3
+"""
+cmux-resume — list recent Claude sessions, pick one, resume it in this terminal.
+
+Default behavior:
+  - If invoked from a cmux workspace that has a registered Claude session
+    (registry kept by ~/.claude/hooks/cmux-registry.py), resume it directly.
+  - Otherwise show a picker of recent sessions, annotated with workspace title
+    where the session was last running.
+
+Flags:
+  cmux-resume --pick         # always show picker, even if this workspace has a match
+  cmux-resume --list         # print only, no picker
+  cmux-resume --limit 50     # max sessions to list (default 30)
+  cmux-resume --hours 6      # only sessions modified in last N hours
+
+On pick: cd to the session's recorded cwd and exec `claude --resume <id>` in
+the current terminal (replaces this process — no new cmux workspace is spawned).
+"""
+import argparse
+import datetime
+import glob
+import json
+import os
+import shlex
+import subprocess
+import sys
+
+SESSIONS_DIR = os.path.expanduser("~/.claude/projects")
+REGISTRY = os.path.expanduser("~/.claude/cmux-registry.json")
+CMUX = "/Applications/cmux.app/Contents/Resources/bin/cmux"
+HOME = os.path.expanduser("~")
+
+
+def _extract_user_text(j):
+    if j.get("type") != "user":
+        return None
+    msg = j.get("message", {})
+    c = msg.get("content")
+    if isinstance(c, list):
+        c = " ".join(
+            x.get("text", "")
+            for x in c
+            if isinstance(x, dict) and x.get("type") == "text"
+        )
+    if not isinstance(c, str):
+        return None
+    s = c.strip()
+    if not s or s.startswith("<"):
+        return None
+    return s
+
+
+def _condense(text):
+    # Collapse whitespace and strip leading markdown header lines
+    lines = [ln.strip() for ln in text.splitlines()]
+    lines = [ln for ln in lines if ln]
+    while lines and (lines[0].startswith("#") or lines[0].lower() in ("## context", "context", "context:")):
+        lines.pop(0)
+    return " ".join(lines)
+
+
+def parse_session(path):
+    sess = os.path.basename(path)[:-6]
+    cwd = ""
+    first_user = ""
+    last_user = ""
+    last_user_ts = ""
+    n_msgs = 0
+    try:
+        with open(path, "r", errors="replace") as fh:
+            for line in fh:
+                try:
+                    j = json.loads(line)
+                except Exception:
+                    continue
+                n_msgs += 1
+                if not cwd and j.get("cwd"):
+                    cwd = j["cwd"]
+                txt = _extract_user_text(j)
+                if txt:
+                    if not first_user:
+                        first_user = _condense(txt)
+                    last_user = _condense(txt)
+                    ts = j.get("timestamp", "")
+                    if ts:
+                        last_user_ts = ts
+    except Exception:
+        pass
+    return {
+        "sess": sess,
+        "path": path,
+        "cwd": cwd or "(unknown)",
+        "mtime": os.path.getmtime(path),
+        "last_user_ts": last_user_ts,
+        "first_user": first_user,
+        "last_user": last_user,
+        "n_msgs": n_msgs,
+    }
+
+
+def humantime(ts):
+    delta = datetime.datetime.now().timestamp() - ts
+    if delta < 60:
+        return f"{int(delta)}s"
+    if delta < 3600:
+        return f"{int(delta/60)}m"
+    if delta < 86400:
+        return f"{int(delta/3600)}h"
+    return f"{int(delta/86400)}d"
+
+
+def shorten_cwd(cwd, width=42):
+    short = cwd.replace(HOME, "~") if cwd.startswith(HOME) else cwd
+    if len(short) > width:
+        short = "…" + short[-(width - 1):]
+    return short
+
+
+def load_registry():
+    """Return {workspace_id: {session_id, cwd, ...}}, with dead workspaces pruned."""
+    try:
+        with open(REGISTRY) as f:
+            reg = json.load(f)
+    except Exception:
+        return {}
+    if not reg:
+        return {}
+    # Prune entries whose workspace no longer exists in cmux.
+    live_ws = _live_workspaces()
+    if live_ws is None:
+        return reg  # cmux unreachable — keep everything
+    pruned = {ws: v for ws, v in reg.items() if ws in live_ws}
+    return pruned
+
+
+def _live_workspaces():
+    """Return dict of {workspace_id: title} from cmux, or None if cmux unreachable."""
+    try:
+        out = subprocess.run(
+            [CMUX, "--json", "--id-format", "both", "list-workspaces"],
+            capture_output=True, text=True, timeout=2,
+        )
+        if out.returncode != 0 or not out.stdout.strip():
+            return None
+        data = json.loads(out.stdout)
+        items = data.get("workspaces") if isinstance(data, dict) else data
+        if not isinstance(items, list):
+            return None
+        result = {}
+        for w in items:
+            wid = w.get("id") or w.get("uuid")
+            title = w.get("title") or w.get("name") or ""
+            if wid:
+                result[wid] = title
+        return result
+    except Exception:
+        return None
+
+
+def auto_resume_for_current_workspace(registry):
+    """If we're in a cmux workspace with a registered session, return that session_id and cwd."""
+    ws = os.environ.get("CMUX_WORKSPACE_ID")
+    if not ws or ws not in registry:
+        return None
+    return registry[ws]
+
+
+def collect_sessions(limit, hours):
+    cutoff = datetime.datetime.now().timestamp() - (hours * 3600) if hours else 0
+    files = []
+    for p in glob.glob(os.path.join(SESSIONS_DIR, "*", "*.jsonl")):
+        if "/subagents/" in p:
+            continue
+        if hours and os.path.getmtime(p) < cutoff:
+            continue
+        files.append(p)
+    files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    files = files[:limit]
+    return [parse_session(p) for p in files]
+
+
+def _term_width():
+    try:
+        return max(80, os.get_terminal_size().columns)
+    except OSError:
+        return 100
+
+
+def _session_to_workspace(registry, ws_titles):
+    """Return {session_id: (workspace_id, workspace_title)}."""
+    out = {}
+    for ws, entry in registry.items():
+        sid = entry.get("session_id")
+        if sid:
+            title = ws_titles.get(ws, "") if ws_titles else ""
+            out[sid] = (ws, title)
+    return out
+
+
+def render(sessions, registry, ws_titles):
+    if not sessions:
+        print("No sessions found.")
+        return
+    width = _term_width()
+    body_width = width - 14
+    sess2ws = _session_to_workspace(registry, ws_titles or {})
+    print()
+    for i, s in enumerate(sessions, 1):
+        warn = "" if os.path.isdir(s["cwd"]) else " ⚠"
+        cwd = shorten_cwd(s["cwd"]) + warn
+        ws_match = sess2ws.get(s["sess"])
+        ws_label = ""
+        if ws_match:
+            _, title = ws_match
+            ws_label = f"  ← workspace: {title or '(untitled)'}"
+        header = f"[{i:>2}]  {humantime(s['mtime']):>4} ago  {s['n_msgs']:>5} msgs   {cwd}{ws_label}"
+        print(header)
+        kick = s["first_user"][:body_width].rstrip()
+        last = s["last_user"][:body_width].rstrip()
+        if kick == last:
+            print(f"      only msg : {kick}")
+        else:
+            print(f"      kickoff  : {kick}")
+            print(f"      latest   : {last}")
+        print()
+
+
+def resume(s):
+    if not os.path.isdir(s["cwd"]):
+        print(f"⚠  cwd {s['cwd']} no longer exists.")
+        ans = input("Resume from current cwd instead? [y/N]: ").strip().lower()
+        if ans != "y":
+            return
+        cwd = os.getcwd()
+    else:
+        cwd = s["cwd"]
+
+    shell = os.environ.get("SHELL", "/bin/zsh")
+    cmd = f"cd {shlex.quote(cwd)} && claude --resume {shlex.quote(s['sess'])}"
+    print(f"$ {cmd}\n")
+    sys.stdout.flush()
+    os.execvp(shell, [shell, "-ic", cmd])
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--list", action="store_true", help="print only, do not prompt")
+    ap.add_argument("--pick", action="store_true", help="always show picker; skip auto-resume")
+    ap.add_argument("--limit", type=int, default=30, help="max sessions to show (default: 30)")
+    ap.add_argument("--hours", type=float, default=0, help="only sessions modified in last N hours")
+    args = ap.parse_args()
+
+    registry = load_registry()
+    ws_titles = _live_workspaces() or {}
+
+    # Auto-resume path: in a workspace with a registered session, just resume it
+    if not args.pick and not args.list:
+        match = auto_resume_for_current_workspace(registry)
+        if match:
+            ws_id = os.environ.get("CMUX_WORKSPACE_ID", "")
+            ws_title = ws_titles.get(ws_id, "")
+            print(f"Workspace '{ws_title or ws_id[:8]}' had session {match['session_id'][:8]}.")
+            ans = input("Resume it? [Y/n] (n = show picker): ").strip().lower()
+            if ans in ("", "y", "yes"):
+                # Synthesize a session-like dict for resume()
+                resume({"sess": match["session_id"], "cwd": match.get("cwd", os.getcwd())})
+                return  # never reached (execvp)
+
+    sessions = collect_sessions(args.limit, args.hours)
+    render(sessions, registry, ws_titles)
+
+    if args.list or not sessions:
+        return
+
+    try:
+        pick = input("Pick # to resume (q to quit): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return
+    if not pick or pick.lower() == "q":
+        return
+    try:
+        idx = int(pick) - 1
+    except ValueError:
+        print("Not a number.")
+        sys.exit(1)
+    if not (0 <= idx < len(sessions)):
+        print("Out of range.")
+        sys.exit(1)
+
+    resume(sessions[idx])
+
+
+if __name__ == "__main__":
+    main()
