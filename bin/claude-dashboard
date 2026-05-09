@@ -328,9 +328,11 @@ def _find_terminal_surface(workspace_id):
         return None, None
 
 
-def resume_in_existing_workspace(session_id, workspace_id, title, rename=True):
-    """Respawn the workspace's terminal surface with `claude --resume <id>`,
-    then optionally rename the workspace. Destructive — replaces pane contents."""
+def resume_in_existing_workspace(session_id, workspace_id):
+    """Respawn the workspace's terminal surface with `claude --resume <id>`.
+    Destructive — replaces pane contents. Does NOT rename the workspace:
+    whatever name the workspace had is preserved (user chose that workspace
+    for a reason)."""
     if not workspace_id:
         raise ValueError("workspace_id required")
 
@@ -348,13 +350,6 @@ def resume_in_existing_workspace(session_id, workspace_id, title, rename=True):
     )
     if result.returncode != 0:
         raise RuntimeError(f"cmux respawn-pane failed: {result.stderr or result.stdout}")
-
-    if rename:
-        safe_title = _sanitize_title(title)
-        subprocess.run(
-            [CMUX, "rename-workspace", "--workspace", workspace_id, "--", safe_title],
-            capture_output=True, text=True, timeout=5,
-        )
 
     # Focus the workspace so the user ends up looking at the new session
     subprocess.run(
@@ -528,11 +523,20 @@ function showToast(msg, kind) {
 }
 
 let cachedWorkspaces = [];
+// Preserve dropdown picks across the 10s refresh cycle.
+// Keyed by session_id → selected workspace_id (empty string = "New workspace").
+const selectionState = new Map();
 
 function renderCards(data) {
   countEl.textContent = data.sessions.length;
   tsEl.textContent = new Date().toLocaleTimeString();
   cachedWorkspaces = data.workspaces || [];
+  // Prune stale selections — if a workspace was closed between refreshes,
+  // drop the selection so the card falls back to "New workspace".
+  const liveWsIds = new Set(cachedWorkspaces.map(w => w.id));
+  for (const [sid, wsId] of selectionState) {
+    if (wsId && !liveWsIds.has(wsId)) selectionState.delete(sid);
+  }
   if (!data.sessions.length) {
     grid.innerHTML = '<div class="empty">No Claude sessions found.</div>';
     return;
@@ -609,6 +613,11 @@ function renderCards(data) {
       opt.title = w.title + (w.has_claude ? ' (has a Claude session — will be replaced)' : '');
       select.appendChild(opt);
     }
+    // Restore previously-picked workspace across refreshes
+    const savedPick = selectionState.get(s.sess);
+    if (savedPick && [...select.options].some(o => o.value === savedPick)) {
+      select.value = savedPick;
+    }
     select.disabled = s.active || !s.cwd_exists;
 
     const btn = document.createElement('button');
@@ -633,7 +642,10 @@ function renderCards(data) {
         }
       }
     }
-    select.onchange = updateButton;
+    select.onchange = () => {
+      selectionState.set(s.sess, select.value);
+      updateButton();
+    };
     updateButton();
     btn.onclick = () => resumeSession(s, btn, select.value);
 
@@ -679,8 +691,11 @@ async function resumeSession(s, btn, targetWorkspaceId) {
     const data = await r.json();
     if (!r.ok) throw new Error(data.error || r.statusText);
     if (data.mode === 'existing') {
-      showToast('Resumed in existing workspace · ' + data.title, 'success');
-      btn.textContent = 'Resumed ·  ' + (data.title || '');
+      const label = data.title ? '"' + data.title + '"' : 'existing workspace';
+      showToast('Resumed in ' + label, 'success');
+      btn.textContent = 'Resumed in ' + (data.title ? '"' + data.title + '"' : 'existing');
+      // Clear the picked selection for this card — we're done with it
+      selectionState.delete(s.sess);
     } else {
       showToast('Opened workspace ' + data.workspace_ref + ' · ' + data.title, 'success');
       btn.textContent = 'Opened · ' + data.workspace_ref;
@@ -793,11 +808,15 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             if target_ws:
-                ref = resume_in_existing_workspace(sid, target_ws, title)
+                # Look up the workspace's current title BEFORE respawning so
+                # we can show the user which workspace they landed in.
+                ws_live = live_workspaces()
+                preserved_title = ws_live.get(target_ws, {}).get("title", "")
+                ref = resume_in_existing_workspace(sid, target_ws)
                 self._send_json(200, {
                     "mode": "existing",
                     "workspace_id": ref,
-                    "title": _sanitize_title(title),
+                    "title": preserved_title,
                 })
             else:
                 if not cwd:
