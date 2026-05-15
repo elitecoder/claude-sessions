@@ -24,7 +24,7 @@ A browser dashboard at `http://127.0.0.1:18577/` that knows every Claude Code se
 Each card shows:
 
 - 🏷  **AI-written title** (Claude Code writes these automatically during a session; we just pick them up)
-- 📝  **One-line work summary** of what actually got done in the session (optional — see [setup](#card-summaries-setup) below; runs locally via Ollama)
+- 📝  **2–3 sentence work summary** of what actually got done in the session (optional — see [setup](#card-summaries-setup) below; runs locally via Ollama). Searchable too — the summary text feeds the lexical filter and the embedding doc, so a phrase that only appears in the LLM's recap of the session still finds it.
 - 🕒  Age, message count, working directory
 - 💬  Raw kickoff prompt · last prompt · last reply (collapsed under a toggle when a summary is present, full when it isn't)
 - 🟢  Green border when the session is live in a cmux workspace
@@ -46,7 +46,7 @@ If the existing workspace already has a Claude session running, the button turns
 
 Three tiers, automatic — type the words you remember and the right tier kicks in:
 
-- **Shallow (instant):** filters the cards you already see against title, kickoff prompt, last prompt, last reply, and cwd. Zero round-trips, debounced 120 ms, with the matched substring highlighted everywhere it appears.
+- **Shallow (instant):** filters the cards you already see against title, the LLM summary (when one's cached), kickoff prompt, last prompt, last reply, and cwd. Zero round-trips, debounced 120 ms, with the matched substring highlighted everywhere it appears.
 - **Deep (automatic fallback):** if shallow returns nothing, the dashboard greps the full JSONL bodies server-side and pulls in any session whose transcript contains the query. Each transcript hit renders a highlighted snippet below the usual previews so you can eyeball the match in context. Haystacks cache per-file by mtime, so repeated searches are effectively free.
 - **Semantic (always-on when configured):** when an embedding provider is set, every query is *also* ranked by embedding similarity. Lexical results stay first; semantically-related sessions get pulled in alongside them via [Reciprocal Rank Fusion](https://www.cs.uwaterloo.ca/~gvcormac/cormacksigir09-rrf.pdf). Each "no exact word match" hit is labelled with a purple `match · semantic` row so you know why it's there. Embeddings are built in the background — a small pill in the header shows progress (`Indexing 124/525 · 22s`) until the index is complete, and the search bar grows an amber warning while a query is active and the index isn't yet covering everything (with a one-click "Wait for full index" button if you want certainty).
 
@@ -226,6 +226,16 @@ I'd rather tell you these up front than let you find them during a bad day.
 - **[Claude Code](https://www.claude.com/product/claude-code)** by [Anthropic](https://www.anthropic.com). The `SessionStart` hook API + the clean JSONL session format made this ~1000 lines of Python instead of a weekend project.
 - **[Scout](https://github.com/Adobe-AIFoundations/scout)** by Adobe AI Foundations. The semantic-search design here — content-hashed embedding cache, hybrid retrieval, RRF fusion, mtime invalidation — is a small Python echo of Scout's much larger Rust pipeline. The wire format and code are entirely independent (Ollama / OpenAI public APIs, sqlite K/V, vanilla cosine), but the architecture is theirs.
 - **Built in a single Claude Code session** with Claude Opus 4.7 (1M context). Yes, really. The session was titled _"Restore Claude sessions after Cmux restart"_ — fittingly, the first thing I did after installing this toolkit was use it to resume that exact conversation.
+
+## Changelog
+
+The repo doesn't keep a separate `CHANGELOG.md` — `git log` is the source of truth. Major sweeps so far:
+
+- **2026-05-15 — semantic search + 3-tier retrieval + per-card LLM summaries.** Header search box. Shallow client filter (instant) + deep transcript grep (auto-fallback) + opt-in semantic ranking via Ollama/OpenAI fused with RRF. Background warmer + honest indexing pill with ETA + amber "missing N sessions" banner with a one-click "Wait for full index" button. Per-card 2–3 sentence LLM summary replaces the kickoff/last-prompt/last-reply boilerplate; raw turns stay reachable via a "show raw" toggle. Summary text feeds both the lexical filter and the embedding doc, so a phrase that only the recap captured still finds the session.
+- **2026-05-14 — first search + cold-start perf fixes.** Initial header search box (lexical-only). Filesystem-scan cache + parallel cold parse to bring `/api/sessions` from 30+ s on a 500-session corpus down to ~300 ms.
+- Earlier — original dashboard, `cmux-resume`, `cmux-resume-smart`, `SessionStart` registry hook.
+
+For the per-commit story, see `git log` on `main` or the closed PRs at https://github.com/elitecoder/claude-sessions/pulls?q=is%3Aclosed.
 
 ## License
 
