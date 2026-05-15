@@ -98,8 +98,25 @@ case "$cmd" in
     curl -sS -X POST "${URL}api/embed/evict"
     echo
     ;;
+  resummarize)
+    if ! curl -sf "${URL}healthz" > /dev/null; then
+      echo "Daemon not responding at $URL — start it first ($0 start)" >&2
+      exit 1
+    fi
+    echo "Generating per-session summaries (this may take a few minutes on first run)…"
+    curl -sS -X POST "${URL}api/summary/reindex"
+    echo
+    ;;
+  evict-summaries)
+    if ! curl -sf "${URL}healthz" > /dev/null; then
+      echo "Daemon not responding at $URL — start it first ($0 start)" >&2
+      exit 1
+    fi
+    curl -sS -X POST "${URL}api/summary/evict"
+    echo
+    ;;
   *)
-    echo "Usage: $0 {install|uninstall|start|stop|restart|status|open|logs|reindex|evict-embeddings}"
+    echo "Usage: $0 {install|uninstall|start|stop|restart|status|open|logs|reindex|evict-embeddings|resummarize|evict-summaries}"
     exit 2
     ;;
 esac

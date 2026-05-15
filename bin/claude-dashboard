@@ -49,6 +49,19 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 # embedding shape simple and let the lexical retrievers handle precision.
 EMBED_DOC_MAX_CHARS = 4000
 
+# LLM-summary provider — used to generate a one-line "what got done" per
+# session for the card UI. Same on/off semantics as the embedder. The default
+# Ollama model is small + fast (qwen2.5:1.5b-instruct: ~1 GB, ~250 ms per
+# call on M-series). OpenAI alternative left wired for parity but
+# uncommon — gpt-4o-mini is the tested option.
+SUMMARY_PROVIDER = os.environ.get("CLAUDE_DASHBOARD_SUMMARY", "off").lower()
+OLLAMA_SUMMARY_MODEL = os.environ.get("CLAUDE_DASHBOARD_SUMMARY_MODEL", "qwen2.5:1.5b-instruct")
+OPENAI_SUMMARY_MODEL = os.environ.get("CLAUDE_DASHBOARD_SUMMARY_MODEL", "gpt-4o-mini")
+# Cap on the prompt we feed to the summarizer. Picking the longest substantive
+# turns from the session usually fits comfortably under this; truncation is a
+# safety net, not the common case.
+SUMMARY_DOC_MAX_CHARS = 8000
+
 # In-memory cache: path -> (mtime_at_parse, parsed_dict).
 # Survives the daemon's lifetime. Each JSONL is parsed once, then re-parsed only
 # when its mtime changes (i.e., the session got new messages).
@@ -102,42 +115,75 @@ def _haystack_pool():
 
 _EMBED_CONN = None
 _EMBED_CONN_LOCK = __import__("threading").Lock()
+# Per-thread sqlite connections. The single shared connection turned out to
+# serialize every read across the warmers and HTTP handlers (sqlite3 with
+# check_same_thread=False still locks at the C level). Each thread gets its
+# own conn pointing at the same file; SQLite's WAL mode handles concurrency.
+_EMBED_TLS = __import__("threading").local()
 _EMBED_INDEX = None  # (sess_id_list, mtime_list, vectors_2d) — built on demand
 _EMBED_INDEX_LOCK = __import__("threading").Lock()
 
 
-def _embed_db():
-    """Open (and lazily migrate) the embedding cache. Schema: one row per
-    (provider, model, content_hash) -> raw float32 bytes."""
+def _embed_db_init():
+    """Initialize schema once. Called at first connection-open time, guarded
+    by the global lock."""
     global _EMBED_CONN
     if _EMBED_CONN is not None:
-        return _EMBED_CONN
+        return
     with _EMBED_CONN_LOCK:
-        if _EMBED_CONN is None:
-            import sqlite3
-            os.makedirs(os.path.dirname(EMBED_DB), exist_ok=True)
-            conn = sqlite3.connect(EMBED_DB, check_same_thread=False)
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS embeddings (
-                    provider TEXT NOT NULL,
-                    model    TEXT NOT NULL,
-                    chash    TEXT NOT NULL,
-                    dim      INTEGER NOT NULL,
-                    vec      BLOB NOT NULL,
-                    PRIMARY KEY (provider, model, chash)
-                )
-            """)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS sessions (
-                    sess     TEXT PRIMARY KEY,
-                    mtime    REAL NOT NULL,
-                    chash    TEXT NOT NULL
-                )
-            """)
-            conn.commit()
-            _EMBED_CONN = conn
-    return _EMBED_CONN
+        if _EMBED_CONN is not None:
+            return
+        import sqlite3
+        os.makedirs(os.path.dirname(EMBED_DB), exist_ok=True)
+        conn = sqlite3.connect(EMBED_DB, check_same_thread=False)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS embeddings (
+                provider TEXT NOT NULL,
+                model    TEXT NOT NULL,
+                chash    TEXT NOT NULL,
+                dim      INTEGER NOT NULL,
+                vec      BLOB NOT NULL,
+                PRIMARY KEY (provider, model, chash)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS sessions (
+                sess     TEXT PRIMARY KEY,
+                mtime    REAL NOT NULL,
+                chash    TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS summaries (
+                provider TEXT NOT NULL,
+                model    TEXT NOT NULL,
+                chash    TEXT NOT NULL,
+                summary  TEXT NOT NULL,
+                PRIMARY KEY (provider, model, chash)
+            )
+        """)
+        conn.commit()
+        # Keep the schema-initializer connection around as a sentinel so
+        # subsequent calls skip the schema work. Per-thread connections do
+        # the actual reads/writes via _embed_db().
+        _EMBED_CONN = conn
+
+
+def _embed_db():
+    """Return a thread-local sqlite connection. SQLite WAL mode handles
+    multi-reader concurrency at the OS level, so each thread gets its own
+    handle and there's no Python-level lock on the read path."""
+    _embed_db_init()
+    conn = getattr(_EMBED_TLS, "conn", None)
+    if conn is not None:
+        return conn
+    import sqlite3
+    conn = sqlite3.connect(EMBED_DB, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=2000")
+    _EMBED_TLS.conn = conn
+    return conn
 
 
 def _embed_doc_for(s):
@@ -227,17 +273,296 @@ def _embed_store(provider, model, chash, vec):
     """Cache write. Stores raw float32 bytes — compact and fast to load."""
     import struct
     blob = struct.pack(f"{len(vec)}f", *vec)
-    with _EMBED_CONN_LOCK:
-        _embed_db().execute(
-            "INSERT OR REPLACE INTO embeddings (provider, model, chash, dim, vec) VALUES (?,?,?,?,?)",
-            (provider, model, chash, len(vec), blob),
-        )
-        _embed_db().commit()
+    conn = _embed_db()
+    conn.execute(
+        "INSERT OR REPLACE INTO embeddings (provider, model, chash, dim, vec) VALUES (?,?,?,?,?)",
+        (provider, model, chash, len(vec), blob),
+    )
+    conn.commit()
 
 
 def _content_hash(text):
     import hashlib
     return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
+
+
+# --- LLM summary cache + extraction ---------------------------------------
+
+# Patterns that mark a turn as boilerplate — resume-prompt scaffolding,
+# /clear-and-resume hand-offs, "get latest from main" housekeeping. These
+# add no information about *what got done*, so we skip them when building
+# the summary doc. Match is case-insensitive prefix.
+_BOILERPLATE_PREFIXES = (
+    "generate a self-contained resume prompt",
+    "resume prompt saved to",
+    "in ~3 seconds this session will",
+    "/clear",
+    "get latest from main",
+    "get latest on main",
+    "get latest main",
+    "are we on latest main",
+    "lets get latest from main",
+    "find this claude session",
+    "find the session where",
+)
+
+
+def _is_boilerplate(text):
+    t = (text or "").strip().lower()
+    if not t:
+        return True
+    for pre in _BOILERPLATE_PREFIXES:
+        if t.startswith(pre):
+            return True
+    return False
+
+
+def _summary_provider_id():
+    """Return (provider, model) currently configured for summaries, or
+    (None, None) if off."""
+    if SUMMARY_PROVIDER == "ollama":
+        return ("ollama", OLLAMA_SUMMARY_MODEL)
+    if SUMMARY_PROVIDER == "openai":
+        return ("openai", OPENAI_SUMMARY_MODEL)
+    return (None, None)
+
+
+# mtime-keyed cache for summary docs. Building one re-reads the JSONL, which
+# is OK rarely (the warmer pulls them on cache miss) but ruinous on every
+# request. The cache key is the path's mtime so an updated session re-reads
+# automatically.
+_SUMMARY_DOC_CACHE = {}
+_SUMMARY_DOC_CACHE_LOCK = __import__("threading").Lock()
+
+
+def _summary_doc_for(s):
+    """Build the prompt body fed to the summarizer. Pulls all substantive user
+    turns + the longest assistant reply from the JSONL, skipping boilerplate
+    (resume-prompt churn, "get latest from main"). Cached by mtime."""
+    path = s.get("path")
+    if not path:
+        return ""
+    mtime = s.get("mtime") or 0
+    with _SUMMARY_DOC_CACHE_LOCK:
+        cached = _SUMMARY_DOC_CACHE.get(path)
+        if cached and cached[0] == mtime:
+            return cached[1]
+
+    user_turns = []
+    longest_assistant = ""
+    longest_assistant_len = 0
+    seen_user = set()
+    try:
+        with open(path, "r", errors="replace") as fh:
+            for line in fh:
+                try:
+                    j = json.loads(line)
+                except Exception:
+                    continue
+                ut = _extract_user_text(j)
+                if ut and not _is_boilerplate(ut):
+                    norm = ut.strip()
+                    if norm not in seen_user:
+                        seen_user.add(norm)
+                        user_turns.append(norm)
+                    continue
+                at = _extract_assistant_text(j)
+                if at:
+                    at = _strip_code_fences(at).strip()
+                    if not _is_boilerplate(at) and len(at) > longest_assistant_len:
+                        longest_assistant = at
+                        longest_assistant_len = len(at)
+    except Exception:
+        pass
+
+    title = s.get("ai_title") or ""
+    parts = []
+    if title:
+        parts.append(f"Title: {title}")
+    if user_turns:
+        joined = "\n- ".join(user_turns[:6])
+        parts.append(f"User asked:\n- {joined}")
+    if longest_assistant:
+        parts.append(f"Assistant's longest answer:\n{longest_assistant[:2000]}")
+    doc = "\n\n".join(parts)
+    if len(doc) > SUMMARY_DOC_MAX_CHARS:
+        doc = doc[:SUMMARY_DOC_MAX_CHARS]
+
+    with _SUMMARY_DOC_CACHE_LOCK:
+        _SUMMARY_DOC_CACHE[path] = (mtime, doc)
+    return doc
+
+
+_SUMMARY_PROMPT = (
+    "Summarize this Claude Code session in ONE short sentence describing "
+    "what was actually accomplished or worked on. Use past tense. No preamble, "
+    "no quotes, no \"This session\". Just the sentence.\n\n{doc}"
+)
+
+
+def _summary_call(doc):
+    """Call the configured summary provider. Returns a plain-text one-liner."""
+    import urllib.request
+    provider, model = _summary_provider_id()
+    if not provider or not doc:
+        return ""
+    prompt = _SUMMARY_PROMPT.format(doc=doc)
+    if provider == "ollama":
+        req = urllib.request.Request(
+            f"{OLLAMA_HOST}/api/generate",
+            data=json.dumps({
+                "model": model,
+                "prompt": prompt,
+                "stream": False,
+                "options": {"num_predict": 80, "temperature": 0.2},
+            }).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=60) as r:
+            resp = json.loads(r.read())
+        return _clean_summary(resp.get("response", ""))
+    if provider == "openai":
+        if not OPENAI_API_KEY:
+            raise RuntimeError("OPENAI_API_KEY not set")
+        req = urllib.request.Request(
+            "https://api.openai.com/v1/chat/completions",
+            data=json.dumps({
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.2,
+                "max_tokens": 80,
+            }).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=60) as r:
+            resp = json.loads(r.read())
+        return _clean_summary(resp["choices"][0]["message"]["content"])
+    raise RuntimeError(f"unknown summary provider: {provider}")
+
+
+def _clean_summary(text):
+    """Strip the model's tendency to over-decorate. One sentence, no quotes,
+    no leading 'This session'."""
+    t = (text or "").strip()
+    # Strip surrounding quotes.
+    if t.startswith(("\"", "'")) and t.endswith(("\"", "'")):
+        t = t[1:-1].strip()
+    # Drop common preambles.
+    for pre in ("this session ", "the session ", "in this session, "):
+        if t.lower().startswith(pre):
+            t = t[len(pre):].strip()
+    # First sentence only.
+    for sep in (". ", ".\n"):
+        i = t.find(sep)
+        if i > 20:
+            t = t[: i + 1]
+            break
+    return t
+
+
+def _summary_lookup(provider, model, chash):
+    cur = _embed_db().execute(
+        "SELECT summary FROM summaries WHERE provider=? AND model=? AND chash=?",
+        (provider, model, chash),
+    )
+    row = cur.fetchone()
+    return row[0] if row else None
+
+
+def _summary_store(provider, model, chash, summary):
+    conn = _embed_db()
+    conn.execute(
+        "INSERT OR REPLACE INTO summaries (provider, model, chash, summary) VALUES (?,?,?,?)",
+        (provider, model, chash, summary),
+    )
+    conn.commit()
+
+
+def _summary_chash_cheap(s):
+    """Cheap content hash from the in-memory parse cache only — no JSONL
+    re-read. Good enough for cache lookups: when any of these change, the
+    summary needs regeneration anyway. Returns None if there's nothing
+    summarizable.
+
+    The full doc (only built when we're actually about to summarize) is
+    keyed on this same hash, so the cache hit path is fast on every poll."""
+    provider, model = _summary_provider_id()
+    if not provider:
+        return None
+    title = s.get("ai_title") or ""
+    fu = s.get("first_user") or ""
+    lu = s.get("last_user") or ""
+    la = s.get("last_assistant") or ""
+    if not (title or fu or lu or la):
+        return None
+    sig = f"sum\n{provider}\n{model}\n{title}\n{fu}\n{lu}\n{la}"
+    return _content_hash(sig)
+
+
+def _lookup_session_summaries(sessions):
+    """Cache-only lookup. Returns (out, summarizable_count)."""
+    provider, model = _summary_provider_id()
+    if not provider:
+        return {}, 0
+    out = {}
+    summarizable = 0
+    for s in sessions:
+        chash = _summary_chash_cheap(s)
+        if not chash:
+            continue
+        summarizable += 1
+        cached = _summary_lookup(provider, model, chash)
+        if cached:
+            out[s["sess"]] = cached
+    return out, summarizable
+
+
+def _ensure_session_summaries(sessions, parallelism=4):
+    """Synchronously fill any missing summaries. Used by the background warmer
+    and a manual /api/summary/reindex endpoint. Parallelism is lower than
+    embeddings — Ollama serializes generate calls under the hood. Doc
+    building (which re-reads the JSONL) only happens for sessions that
+    actually need a summary, never for cache hits."""
+    provider, model = _summary_provider_id()
+    if not provider:
+        return {}
+    todo = []  # list of (session_obj, chash) — defer doc-build to the worker
+    out = {}
+    for s in sessions:
+        chash = _summary_chash_cheap(s)
+        if not chash:
+            continue
+        cached = _summary_lookup(provider, model, chash)
+        if cached:
+            out[s["sess"]] = cached
+        else:
+            todo.append((s, chash))
+    if not todo:
+        return out
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _one(item):
+        s, chash = item
+        try:
+            doc = _summary_doc_for(s)
+            if not doc:
+                return s["sess"], chash, ""
+            summary = _summary_call(doc)
+        except Exception:
+            summary = ""
+        return s["sess"], chash, summary
+
+    with ThreadPoolExecutor(max_workers=parallelism, thread_name_prefix="summary") as ex:
+        for fut in ex.map(_one, todo):
+            sess, chash, summary = fut
+            if summary:
+                _summary_store(provider, model, chash, summary)
+                out[sess] = summary
+    return out
 
 
 def _lookup_session_embeddings(sessions):
@@ -378,6 +703,72 @@ def _request_warm():
         return
     _start_warmer_if_configured()
     _WARMER_TRIGGER.set()
+
+
+# --- Summary warmer ----------------------------------------------------------
+# Same shape as the embedding warmer, separate thread because the rate is very
+# different (one model ~250 ms/call vs the embedder's ~50 ms/call) and we want
+# them to run in parallel. Sqlite WAL handles concurrent writers fine.
+_SUMMARY_THREAD = None
+_SUMMARY_TRIGGER = __import__("threading").Event()
+_SUMMARY_BUSY = False
+_SUMMARY_LOCK = __import__("threading").Lock()
+_SUMMARY_LAST_RUN = 0.0
+_SUMMARY_LAST_DURATION = 0.0
+_SUMMARY_LAST_FILLED = 0
+_SUMMARY_SEC_PER_ITEM = 0.0
+
+
+def _summary_warmer_loop():
+    global _SUMMARY_BUSY, _SUMMARY_LAST_RUN, _SUMMARY_LAST_DURATION
+    global _SUMMARY_LAST_FILLED, _SUMMARY_SEC_PER_ITEM
+    while True:
+        _SUMMARY_TRIGGER.wait()
+        _SUMMARY_TRIGGER.clear()
+        _SUMMARY_BUSY = True
+        t0 = time.time()
+        filled = 0
+        try:
+            sessions = collect_sessions()
+            before = len(_lookup_session_summaries(sessions)[0])
+            _ensure_session_summaries(sessions, parallelism=4)
+            after = len(_lookup_session_summaries(sessions)[0])
+            filled = max(0, after - before)
+        except Exception:
+            traceback.print_exc()
+        dur = time.time() - t0
+        _SUMMARY_LAST_RUN = time.time()
+        _SUMMARY_LAST_DURATION = dur
+        _SUMMARY_LAST_FILLED = filled
+        if filled > 0 and dur > 0:
+            sample = dur / filled
+            if _SUMMARY_SEC_PER_ITEM <= 0:
+                _SUMMARY_SEC_PER_ITEM = sample
+            else:
+                _SUMMARY_SEC_PER_ITEM = 0.3 * sample + 0.7 * _SUMMARY_SEC_PER_ITEM
+        _SUMMARY_BUSY = False
+
+
+def _start_summary_warmer_if_configured():
+    global _SUMMARY_THREAD
+    if SUMMARY_PROVIDER == "off":
+        return
+    with _SUMMARY_LOCK:
+        if _SUMMARY_THREAD is not None:
+            return
+        import threading
+        _SUMMARY_THREAD = threading.Thread(
+            target=_summary_warmer_loop, name="summary-warmer", daemon=True
+        )
+        _SUMMARY_THREAD.start()
+    _SUMMARY_TRIGGER.set()
+
+
+def _request_summary_warm():
+    if SUMMARY_PROVIDER == "off":
+        return
+    _start_summary_warmer_if_configured()
+    _SUMMARY_TRIGGER.set()
 
 
 def _cosine(a, b):
@@ -829,6 +1220,28 @@ def build_payload(include_hidden=False, query="", deep=False):
     # Cache-only on the request path: missing embeddings simply don't
     # contribute to the ranking this turn, and a background warmer fills them
     # for next time. Lexical search keeps working throughout.
+    # Card summaries (separate provider from embeddings). Skip the per-session
+    # lookup loop entirely when the table is empty — that's the common case
+    # when summaries haven't been opted into yet, and there's no point
+    # hashing 500 sessions just to learn the answer is "no rows".
+    summary_map = {}
+    summary_pending = 0
+    summary_indexed = 0
+    summary_total = 0
+    if SUMMARY_PROVIDER != "off":
+        try:
+            cur = _embed_db().execute("SELECT COUNT(*) FROM summaries")
+            row_count = cur.fetchone()[0]
+            if row_count:
+                summary_map, summarizable = _lookup_session_summaries(sessions)
+                summary_indexed = len(summary_map)
+                summary_total = summarizable
+                summary_pending = max(0, summarizable - len(summary_map))
+                if summary_pending:
+                    _request_summary_warm()
+        except Exception:
+            traceback.print_exc()
+
     semantic_ranks = []
     semantic_error = ""
     semantic_used = False
@@ -946,6 +1359,7 @@ def build_payload(include_hidden=False, query="", deep=False):
                 "hidden": is_hidden,
                 "matched_field": matched_field,
                 "snippet": snippet,
+                "summary": summary_map.get(s["sess"], ""),
             }
             out.append(row)
             by_sess[s["sess"]] = row
@@ -983,6 +1397,7 @@ def build_payload(include_hidden=False, query="", deep=False):
                 "hidden": src["sess"] in hidden_ids,
                 "matched_field": "semantic",
                 "snippet": "",
+                "summary": summary_map.get(src["sess"], ""),
             }
             out.append(row)
             by_sess[src["sess"]] = row
@@ -1020,6 +1435,13 @@ def build_payload(include_hidden=False, query="", deep=False):
         # pass. 0 until the warmer has done at least one pass with work to
         # do. UI uses this × pending to compute an ETA.
         "semantic_sec_per_embed": round(_WARMER_SEC_PER_EMBED, 4),
+        # Card summaries (independent provider — see CLAUDE_DASHBOARD_SUMMARY).
+        "summary_provider": SUMMARY_PROVIDER if SUMMARY_PROVIDER != "off" else "",
+        "summary_indexed": summary_indexed,
+        "summary_total": summary_total,
+        "summary_pending": summary_pending,
+        "summary_warming": _SUMMARY_BUSY,
+        "summary_sec_per_item": round(_SUMMARY_SEC_PER_ITEM, 4),
     }
 
 
@@ -1310,6 +1732,33 @@ DASHBOARD_HTML = r"""<!doctype html>
   .card .preview { font-size: 13px; line-height: 1.45; color: var(--fg-muted); }
   .card .preview b { color: var(--fg); font-weight: 600; margin-right: 6px; }
   .card .preview p { margin: 0 0 4px; overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+  .card .preview p.summary {
+    color: var(--fg);
+    font-size: 13.5px;
+    line-height: 1.5;
+    -webkit-line-clamp: 4;
+    margin-bottom: 6px;
+  }
+  .card .preview p.summary .summary-icon { margin-right: 6px; opacity: 0.6; }
+  .card .preview-raw {
+    margin-top: 4px;
+    color: var(--fg-muted);
+  }
+  .card .preview-raw > summary {
+    cursor: pointer;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--fg-muted);
+    opacity: 0.6;
+    list-style: none;
+    user-select: none;
+    padding: 2px 0;
+  }
+  .card .preview-raw > summary::-webkit-details-marker { display: none; }
+  .card .preview-raw > summary:hover { opacity: 1; }
+  .card .preview-raw[open] > summary { opacity: 0.85; }
+  .card .preview-raw p { margin-top: 4px; }
   .card .actions { display: flex; gap: 8px; margin-top: auto; padding-top: 6px; align-items: center; }
   .card select {
     font: inherit; font-size: 12px;
@@ -1614,20 +2063,57 @@ function renderCards(data) {
 
     const preview = document.createElement('div');
     preview.className = 'preview';
-    if (s.kickoff) {
-      const p = document.createElement('p');
-      p.innerHTML = '<b>kickoff</b>' + hilite(s.kickoff);
-      preview.appendChild(p);
-    }
-    if (s.latest_user && s.latest_user !== s.kickoff) {
-      const p = document.createElement('p');
-      p.innerHTML = '<b>last prompt</b>' + hilite(s.latest_user);
-      preview.appendChild(p);
-    }
-    if (s.latest_assistant) {
-      const p = document.createElement('p');
-      p.innerHTML = '<b>last reply</b>' + hilite(s.latest_assistant);
-      preview.appendChild(p);
+    // When a summary is available, surface it as the prominent top row and
+    // demote the raw kickoff/last-prompt/last-reply lines into a hidden
+    // details block reachable on click. This keeps the card scannable —
+    // the summary tells you *what got done*, the raw turns are still there
+    // when you want them.
+    if (s.summary) {
+      const sum = document.createElement('p');
+      sum.className = 'summary';
+      sum.innerHTML = '<span class="summary-icon">📝</span>' + hilite(s.summary);
+      preview.appendChild(sum);
+      if (s.kickoff || s.latest_user || s.latest_assistant) {
+        const det = document.createElement('details');
+        det.className = 'preview-raw';
+        const sm = document.createElement('summary');
+        sm.textContent = 'show raw kickoff / last prompt / last reply';
+        det.appendChild(sm);
+        if (s.kickoff) {
+          const p = document.createElement('p');
+          p.innerHTML = '<b>kickoff</b>' + hilite(s.kickoff);
+          det.appendChild(p);
+        }
+        if (s.latest_user && s.latest_user !== s.kickoff) {
+          const p = document.createElement('p');
+          p.innerHTML = '<b>last prompt</b>' + hilite(s.latest_user);
+          det.appendChild(p);
+        }
+        if (s.latest_assistant) {
+          const p = document.createElement('p');
+          p.innerHTML = '<b>last reply</b>' + hilite(s.latest_assistant);
+          det.appendChild(p);
+        }
+        preview.appendChild(det);
+      }
+    } else {
+      // No summary yet (provider off, or warmer hasn't reached this session).
+      // Fall back to the original three-line preview.
+      if (s.kickoff) {
+        const p = document.createElement('p');
+        p.innerHTML = '<b>kickoff</b>' + hilite(s.kickoff);
+        preview.appendChild(p);
+      }
+      if (s.latest_user && s.latest_user !== s.kickoff) {
+        const p = document.createElement('p');
+        p.innerHTML = '<b>last prompt</b>' + hilite(s.latest_user);
+        preview.appendChild(p);
+      }
+      if (s.latest_assistant) {
+        const p = document.createElement('p');
+        p.innerHTML = '<b>last reply</b>' + hilite(s.latest_assistant);
+        preview.appendChild(p);
+      }
     }
     // Deep-search hit: show the transcript snippet in its own styled row so
     // it's obvious this match came from the body, not the preview fields.
@@ -2102,6 +2588,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path not in (
             "/api/resume", "/api/hide", "/api/unhide",
             "/api/embed/reindex", "/api/embed/evict",
+            "/api/summary/reindex", "/api/summary/evict",
         ):
             self._send_json(404, {"error": "not found"})
             return
@@ -2153,11 +2640,42 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/api/embed/evict":
             try:
                 conn = _embed_db()
-                with _EMBED_CONN_LOCK:
-                    cur = conn.execute("SELECT COUNT(*) FROM embeddings")
-                    before = cur.fetchone()[0]
-                    conn.execute("DELETE FROM embeddings")
-                    conn.commit()
+                cur = conn.execute("SELECT COUNT(*) FROM embeddings")
+                before = cur.fetchone()[0]
+                conn.execute("DELETE FROM embeddings")
+                conn.commit()
+                self._send_json(200, {"evicted": before})
+            except Exception as e:
+                traceback.print_exc()
+                self._send_json(500, {"error": str(e)})
+            return
+
+        if self.path == "/api/summary/reindex":
+            if SUMMARY_PROVIDER == "off":
+                self._send_json(400, {"error": "no summary provider configured"})
+                return
+            try:
+                sessions = collect_sessions()
+                t0 = time.time()
+                summaries = _ensure_session_summaries(sessions, parallelism=4)
+                self._send_json(200, {
+                    "provider": SUMMARY_PROVIDER,
+                    "sessions_total": len(sessions),
+                    "summaries": len(summaries),
+                    "elapsed_seconds": round(time.time() - t0, 2),
+                })
+            except Exception as e:
+                traceback.print_exc()
+                self._send_json(500, {"error": str(e)})
+            return
+
+        if self.path == "/api/summary/evict":
+            try:
+                conn = _embed_db()
+                cur = conn.execute("SELECT COUNT(*) FROM summaries")
+                before = cur.fetchone()[0]
+                conn.execute("DELETE FROM summaries")
+                conn.commit()
                 self._send_json(200, {"evicted": before})
             except Exception as e:
                 traceback.print_exc()
@@ -2200,10 +2718,13 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    # Start the embedding warmer in the background so semantic search is
-    # ready by the time the user types a query (or, on cold install, ~25s
-    # later for a 500-session corpus). No-op when no provider is configured.
+    # Start the embedding warmer. Always safe — fast small embeddings, low GIL
+    # impact. The summary warmer is heavier (LLM generation per session) and
+    # is opt-in: trigger via `claude-dashboard-ctl resummarize` once you're
+    # ready to spend the ~2 min cold-start cost.
     _start_warmer_if_configured()
+    if os.environ.get("CLAUDE_DASHBOARD_SUMMARY_AUTO", "").lower() in ("1", "true", "yes"):
+        _start_summary_warmer_if_configured()
     srv = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     print(f"claude-dashboard listening on http://127.0.0.1:{PORT}", flush=True)
     try:

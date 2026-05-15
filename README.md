@@ -24,8 +24,9 @@ A browser dashboard at `http://127.0.0.1:18577/` that knows every Claude Code se
 Each card shows:
 
 - 🏷  **AI-written title** (Claude Code writes these automatically during a session; we just pick them up)
+- 📝  **One-line work summary** of what actually got done in the session (optional — see [setup](#card-summaries-setup) below; runs locally via Ollama)
 - 🕒  Age, message count, working directory
-- 💬  Kickoff prompt · last prompt · last reply — so you can identify sessions at a glance, not just by name
+- 💬  Raw kickoff prompt · last prompt · last reply (collapsed under a toggle when a summary is present, full when it isn't)
 - 🟢  Green border when the session is live in a cmux workspace
 - 🟨  Amber warning when you're about to do something destructive
 - 🔍  Searchable by keyword — across titles, previews, **and** the full JSONL transcript when you need it
@@ -82,6 +83,39 @@ The cache lives at `~/.claude/cmux-dashboard-embeddings.sqlite`, keyed by `(prov
 | `OLLAMA_HOST`               | `http://127.0.0.1:11434` | Ollama daemon URL                                               |
 | `CLAUDE_DASHBOARD_EMBED_MODEL` | `nomic-embed-text` (Ollama) / `text-embedding-3-small` (OpenAI) | Override model name |
 | `OPENAI_API_KEY`            | _(none)_             | Required when `EMBED=openai`                                    |
+
+### Card summaries setup
+
+Off by default. The default card preview is `kickoff prompt / last prompt / last reply`, which is often dominated by resume-prompt scaffolding ("Generate a self-contained resume prompt…", "Resume prompt saved to…", "get latest from main"). Turning on summaries replaces those three lines with a single one-line LLM-written description of *what actually got done* in the session.
+
+![Cards with one-line summaries](docs/images/cards-with-summaries.png)
+
+```bash
+# Pull a small instruct model — qwen2.5:1.5b-instruct is the tested default,
+# ~1 GB, ~250 ms per session on M-series
+ollama pull qwen2.5:1.5b-instruct
+
+# Tell the dashboard to use it
+launchctl bootout gui/$(id -u)/com.$USER.claude-dashboard
+plist=~/Library/LaunchAgents/com.$USER.claude-dashboard.plist
+# Open $plist and add inside <key>EnvironmentVariables</key>:
+#   <key>CLAUDE_DASHBOARD_SUMMARY</key>
+#   <string>ollama</string>
+launchctl bootstrap gui/$(id -u) "$plist"
+
+# Backfill the summary cache. ~2 min for 500 sessions on M-series.
+claude-dashboard-ctl resummarize
+```
+
+**Why opt-in?** Generating one summary per session means one Ollama LLM call per session. On a fresh corpus that's a few minutes of background work; on a steady-state corpus (a few new/changed sessions per refresh) it's near-zero, but enough to compete with the embedder warmer on the GIL during the cold backfill. Running it as a one-shot via `claude-dashboard-ctl resummarize` lets you spend that cost on your terms. Once the cache is filled the daemon's background warmer keeps it incrementally up to date — set `CLAUDE_DASHBOARD_SUMMARY_AUTO=1` in the plist if you want that to start automatically at every daemon launch.
+
+The summaries live in the same `~/.claude/cmux-dashboard-embeddings.sqlite` keyed on a `(provider, model, content_hash)` of the session's title + substantive turns (boilerplate skipped). Drop them with `claude-dashboard-ctl evict-summaries`. Sessions without a cached summary fall back to the original three-line preview.
+
+| Env var                          | Default                | Notes                                                                |
+| -------------------------------- | ---------------------- | -------------------------------------------------------------------- |
+| `CLAUDE_DASHBOARD_SUMMARY`       | `off`                  | `off` / `ollama` / `openai`                                          |
+| `CLAUDE_DASHBOARD_SUMMARY_MODEL` | `qwen2.5:1.5b-instruct` (Ollama) / `gpt-4o-mini` (OpenAI) | Override model |
+| `CLAUDE_DASHBOARD_SUMMARY_AUTO`  | _(unset)_              | Set to `1` to start the background summary-warmer on daemon launch instead of running it manually |
 
 **Other goodies in the box:**
 
@@ -160,6 +194,8 @@ Reverses everything. Your session data is untouched — it lives in `~/.claude/p
 │  POST /api/unhide   → restore a hidden card                     │
 │  POST /api/embed/reindex → (re)build embeddings for all sessions │
 │  POST /api/embed/evict   → drop the embedding cache             │
+│  POST /api/summary/reindex → (re)build per-card summaries        │
+│  POST /api/summary/evict   → drop the summary cache              │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
