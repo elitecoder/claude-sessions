@@ -394,9 +394,12 @@ def _summary_doc_for(s):
 
 
 _SUMMARY_PROMPT = (
-    "Summarize this Claude Code session in ONE short sentence describing "
-    "what was actually accomplished or worked on. Use past tense. No preamble, "
-    "no quotes, no \"This session\". Just the sentence.\n\n{doc}"
+    "Summarize this Claude Code session in EXACTLY 2-3 short sentences. "
+    "Cover: (1) what the user was trying to do, (2) what was actually built, "
+    "fixed, decided, or learned, (3) what's left open or notable about the "
+    "outcome. Use past tense. No preamble, no quotes, no \"This session\", "
+    "no headings, no bullets — just the sentences run together as a "
+    "paragraph.\n\n{doc}"
 )
 
 
@@ -414,7 +417,7 @@ def _summary_call(doc):
                 "model": model,
                 "prompt": prompt,
                 "stream": False,
-                "options": {"num_predict": 80, "temperature": 0.2},
+                "options": {"num_predict": 220, "temperature": 0.2},
             }).encode("utf-8"),
             headers={"Content-Type": "application/json"},
         )
@@ -430,7 +433,7 @@ def _summary_call(doc):
                 "model": model,
                 "messages": [{"role": "user", "content": prompt}],
                 "temperature": 0.2,
-                "max_tokens": 80,
+                "max_tokens": 220,
             }).encode("utf-8"),
             headers={
                 "Content-Type": "application/json",
@@ -444,23 +447,46 @@ def _summary_call(doc):
 
 
 def _clean_summary(text):
-    """Strip the model's tendency to over-decorate. One sentence, no quotes,
-    no leading 'This session'."""
+    """Strip the model's tendency to over-decorate. 2–3 sentences, no quotes,
+    no leading 'This session', no markdown headings or bullets."""
     t = (text or "").strip()
     # Strip surrounding quotes.
     if t.startswith(("\"", "'")) and t.endswith(("\"", "'")):
         t = t[1:-1].strip()
+    # Drop markdown bullets / headings the model sometimes emits despite the
+    # prompt asking for prose.
+    lines = []
+    for ln in t.splitlines():
+        s = ln.strip()
+        if not s:
+            continue
+        if s.startswith(("- ", "* ", "• ", "#")):
+            s = s.lstrip("-*• #").strip()
+        lines.append(s)
+    t = " ".join(lines)
     # Drop common preambles.
-    for pre in ("this session ", "the session ", "in this session, "):
+    for pre in (
+        "this session ", "the session ", "in this session, ",
+        "this claude code session ", "the claude code session ",
+    ):
         if t.lower().startswith(pre):
             t = t[len(pre):].strip()
-    # First sentence only.
-    for sep in (". ", ".\n"):
-        i = t.find(sep)
-        if i > 20:
-            t = t[: i + 1]
+            t = t[0].upper() + t[1:] if t else t
             break
-    return t
+    # Cap at the first 3 sentences — anything beyond that is the model
+    # padding past the requested length.
+    sentences = []
+    buf = ""
+    for ch in t:
+        buf += ch
+        if ch in ".!?" and len(buf.strip()) > 10:
+            sentences.append(buf.strip())
+            buf = ""
+            if len(sentences) >= 3:
+                break
+    if buf.strip() and len(sentences) < 3:
+        sentences.append(buf.strip())
+    return " ".join(sentences) or t
 
 
 def _summary_lookup(provider, model, chash):
@@ -1673,7 +1699,7 @@ DASHBOARD_HTML = r"""<!doctype html>
   }
   header .hidden-toggle:hover { color: var(--fg); border-color: var(--accent-dim); }
   header .hidden-toggle.active { color: var(--accent); border-color: var(--accent); background: rgba(122,162,247,0.08); }
-  main { padding: 20px 32px 40px; display: grid; grid-template-columns: repeat(auto-fill, minmax(420px, 1fr)); gap: 16px; }
+  main { padding: 20px 32px 40px; display: grid; grid-template-columns: repeat(auto-fill, minmax(460px, 1fr)); gap: 16px; }
   .card {
     background: var(--bg-card);
     border: 1px solid var(--border);
@@ -1736,7 +1762,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     color: var(--fg);
     font-size: 13.5px;
     line-height: 1.5;
-    -webkit-line-clamp: 4;
+    -webkit-line-clamp: 8;
     margin-bottom: 6px;
   }
   .card .preview p.summary .summary-icon { margin-right: 6px; opacity: 0.6; }
