@@ -240,15 +240,37 @@ def _content_hash(text):
     return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
 
 
+def _lookup_session_embeddings(sessions):
+    """Cache-only lookup. Never embeds, never blocks on the network. Returns
+    (out, embeddable_count): out maps sess_id -> list[float] for cache hits,
+    and embeddable_count is the number of sessions that *could* be embedded
+    (have a non-empty summary doc). Used on the request path so search
+    latency is bounded by sqlite + cosine, never by Ollama."""
+    provider, model = _embed_provider_id()
+    if not provider:
+        return {}, 0
+    out = {}
+    embeddable = 0
+    for s in sessions:
+        doc = _embed_doc_for(s)
+        if not doc:
+            continue
+        embeddable += 1
+        chash = _content_hash(f"{provider}\n{model}\n{doc}")
+        cached = _embed_lookup(provider, model, chash)
+        if cached:
+            out[s["sess"]] = cached
+    return out, embeddable
+
+
 def _ensure_session_embeddings(sessions, parallelism=8):
-    """For each session in `sessions`, make sure (provider, model) has an
-    embedding for its current content hash. Uses the parse-cache thread pool
-    to parallelize the network calls. Returns a dict sess_id -> list[float]."""
+    """Synchronously fill any missing embeddings. Used by the explicit
+    /api/embed/reindex endpoint and the startup warmer. Not on the request
+    hot path — that goes through _lookup_session_embeddings instead."""
     provider, model = _embed_provider_id()
     if not provider:
         return {}
-    # Build doc + chash for each session and look up cache
-    todo = []  # list of (sess, doc, chash)
+    todo = []
     out = {}
     for s in sessions:
         doc = _embed_doc_for(s)
@@ -264,9 +286,6 @@ def _ensure_session_embeddings(sessions, parallelism=8):
     if not todo:
         return out
 
-    # Network calls in parallel — Ollama serializes per request anyway, but
-    # the wait time per request is dominated by GPU/CPU, so 4–8 in flight is
-    # a pragmatic batch.
     from concurrent.futures import ThreadPoolExecutor
     def _one(item):
         sess, doc, chash = item
@@ -279,6 +298,86 @@ def _ensure_session_embeddings(sessions, parallelism=8):
             _embed_store(provider, model, chash, vec)
             out[sess] = vec
     return out
+
+
+# Background warmer: a single long-lived worker that keeps the embedding
+# cache hot. Triggered from build_payload() when a request notices missing
+# embeddings, and once at daemon startup. Coalesced — only one warm runs at
+# a time; concurrent triggers just mark "needs another pass" and the worker
+# does it after the current pass finishes.
+_WARMER_THREAD = None
+_WARMER_TRIGGER = __import__("threading").Event()
+_WARMER_BUSY = False
+_WARMER_LOCK = __import__("threading").Lock()
+_WARMER_LAST_RUN = 0.0
+_WARMER_LAST_DURATION = 0.0
+_WARMER_LAST_FILLED = 0
+# Exponential moving average of seconds-per-embedding across warmer passes.
+# Lets the UI compute a useful ETA on the first run when no other signal
+# exists; updated on every pass that actually filled at least one slot.
+_WARMER_SEC_PER_EMBED = 0.0
+
+
+def _warmer_loop():
+    """Body of the background warmer thread. Sleeps on _WARMER_TRIGGER and
+    runs _ensure_session_embeddings over the current session list. Errors
+    are swallowed (provider down, network blip) — the next trigger retries.
+    Also tracks throughput so the UI can show an honest ETA."""
+    global _WARMER_BUSY, _WARMER_LAST_RUN, _WARMER_LAST_DURATION
+    global _WARMER_LAST_FILLED, _WARMER_SEC_PER_EMBED
+    while True:
+        _WARMER_TRIGGER.wait()
+        _WARMER_TRIGGER.clear()
+        _WARMER_BUSY = True
+        t0 = time.time()
+        filled = 0
+        try:
+            sessions = collect_sessions()
+            before = len(_lookup_session_embeddings(sessions)[0])
+            _ensure_session_embeddings(sessions, parallelism=8)
+            after = len(_lookup_session_embeddings(sessions)[0])
+            filled = max(0, after - before)
+        except Exception:
+            traceback.print_exc()
+        dur = time.time() - t0
+        _WARMER_LAST_RUN = time.time()
+        _WARMER_LAST_DURATION = dur
+        _WARMER_LAST_FILLED = filled
+        # Update the s/embed EMA only when the pass actually filled something —
+        # zero-fill passes (no work to do) carry no information about throughput.
+        if filled > 0 and dur > 0:
+            sample = dur / filled
+            if _WARMER_SEC_PER_EMBED <= 0:
+                _WARMER_SEC_PER_EMBED = sample
+            else:
+                # Light EMA — 30% new, 70% old. Smooths out one-off spikes.
+                _WARMER_SEC_PER_EMBED = 0.3 * sample + 0.7 * _WARMER_SEC_PER_EMBED
+        _WARMER_BUSY = False
+
+
+def _start_warmer_if_configured():
+    """Spawn the background warmer once. No-op if no provider is set."""
+    global _WARMER_THREAD
+    if EMBED_PROVIDER == "off":
+        return
+    with _WARMER_LOCK:
+        if _WARMER_THREAD is not None:
+            return
+        import threading
+        _WARMER_THREAD = threading.Thread(
+            target=_warmer_loop, name="embed-warmer", daemon=True
+        )
+        _WARMER_THREAD.start()
+    # Kick a first pass right away.
+    _WARMER_TRIGGER.set()
+
+
+def _request_warm():
+    """Idempotent nudge. Safe to call from any thread. Returns immediately."""
+    if EMBED_PROVIDER == "off":
+        return
+    _start_warmer_if_configured()
+    _WARMER_TRIGGER.set()
 
 
 def _cosine(a, b):
@@ -298,23 +397,6 @@ def _cosine(a, b):
     if na == 0.0 or nb == 0.0:
         return 0.0
     return dot / ((na ** 0.5) * (nb ** 0.5))
-
-
-def _semantic_rank(sessions, query, top_n=50):
-    """Return [(sess_id, score), ...] ranked by cosine similarity to the query.
-    Uses the embedding cache for everything except the query itself."""
-    if not query.strip():
-        return []
-    embeds = _ensure_session_embeddings(sessions)
-    if not embeds:
-        return []
-    qvec = _embed_call([query])[0]
-    scored = []
-    for sess_id, svec in embeds.items():
-        sim = _cosine(qvec, svec)
-        scored.append((sess_id, sim))
-    scored.sort(key=lambda t: t[1], reverse=True)
-    return scored[:top_n]
 
 
 def _rrf_fuse(rankings, k=60):
@@ -732,7 +814,7 @@ def _match_deep(s, q_lower):
     return _snippet_from_file(path, q_lower) or "(match)"
 
 
-def build_payload(include_hidden=False, query="", deep=False, semantic=False):
+def build_payload(include_hidden=False, query="", deep=False):
     sessions = collect_sessions()
     registry = load_registry()
     ws_live = live_workspaces()
@@ -743,18 +825,36 @@ def build_payload(include_hidden=False, query="", deep=False, semantic=False):
         # Parallel warm-up so 2000+ cold file reads don't serialize.
         _warm_haystacks([s["path"] for s in sessions if "path" in s])
 
-    # Semantic-search retriever runs alongside the lexical ones. We compute
-    # rankings (lists of session ids) for each retriever separately and then
-    # fuse with RRF. If semantic is requested but the provider is off or the
-    # call fails, we degrade to lexical-only without surfacing an error.
+    # Semantic retriever runs automatically whenever a provider is configured.
+    # Cache-only on the request path: missing embeddings simply don't
+    # contribute to the ranking this turn, and a background warmer fills them
+    # for next time. Lexical search keeps working throughout.
     semantic_ranks = []
     semantic_error = ""
     semantic_used = False
-    if q_lower and semantic and EMBED_PROVIDER != "off":
+    semantic_pending = 0
+    semantic_indexed = 0
+    semantic_total = 0
+    if EMBED_PROVIDER != "off":
         try:
-            scored = _semantic_rank(sessions, query, top_n=50)
-            semantic_ranks = [sess for sess, _ in scored]
-            semantic_used = bool(semantic_ranks)
+            embeds, embeddable = _lookup_session_embeddings(sessions)
+            semantic_indexed = len(embeds)
+            semantic_total = embeddable
+            # Only sessions that *could* be embedded count as pending. Sessions
+            # without any title/prompt/reply text (e.g. opened-then-closed
+            # immediately) get skipped permanently and shouldn't make the
+            # status pill say "indexing 6…" forever.
+            semantic_pending = max(0, embeddable - len(embeds))
+            if semantic_pending:
+                _request_warm()
+            if q_lower and embeds:
+                qvec = _embed_call([query])[0]
+                scored = [
+                    (sid, _cosine(qvec, v)) for sid, v in embeds.items()
+                ]
+                scored.sort(key=lambda t: t[1], reverse=True)
+                semantic_ranks = [sid for sid, _ in scored[:50]]
+                semantic_used = bool(semantic_ranks)
         except Exception as e:
             semantic_error = str(e)
 
@@ -908,11 +1008,18 @@ def build_payload(include_hidden=False, query="", deep=False, semantic=False):
         "query": query,
         "deep": deep,
         "deep_hits": deep_hits,
-        "semantic": semantic,
         "semantic_used": semantic_used,
         "semantic_provider": EMBED_PROVIDER if EMBED_PROVIDER != "off" else "",
         "semantic_error": semantic_error,
         "semantic_only_count": len(semantic_only_added),
+        "semantic_pending": semantic_pending,
+        "semantic_warming": _WARMER_BUSY,
+        "semantic_indexed": semantic_indexed,
+        "semantic_total": semantic_total,
+        # Seconds-per-embedding the warmer measured on its last productive
+        # pass. 0 until the warmer has done at least one pass with work to
+        # do. UI uses this × pending to compute an ETA.
+        "semantic_sec_per_embed": round(_WARMER_SEC_PER_EMBED, 4),
     }
 
 
@@ -1051,7 +1158,28 @@ DASHBOARD_HTML = r"""<!doctype html>
   }
   * { box-sizing: border-box; }
   html, body { margin: 0; padding: 0; font-family: -apple-system, "SF Pro Text", system-ui, sans-serif; background: var(--bg); color: var(--fg); }
-  header { padding: 24px 32px 12px; display: flex; align-items: baseline; gap: 16px; border-bottom: 1px solid var(--border); }
+  header { padding: 24px 32px 12px; display: flex; flex-direction: column; gap: 8px; border-bottom: 1px solid var(--border); }
+  header .header-row { display: flex; align-items: baseline; gap: 16px; }
+  header .index-warning {
+    display: none; align-items: center; gap: 12px;
+    padding: 8px 12px; margin-top: 4px;
+    border: 1px solid rgba(224, 175, 104, 0.4);
+    border-radius: 8px;
+    background: rgba(224, 175, 104, 0.08);
+    color: var(--fg);
+    font-size: 12px;
+  }
+  header .index-warning.visible { display: flex; }
+  header .index-warning button {
+    margin-left: auto;
+    font: inherit; font-size: 12px;
+    padding: 4px 10px;
+    border-radius: 999px; border: 1px solid var(--amber);
+    background: rgba(224, 175, 104, 0.16); color: var(--amber);
+    cursor: pointer; white-space: nowrap;
+  }
+  header .index-warning button:hover { background: rgba(224, 175, 104, 0.28); }
+  header .index-warning button:disabled { opacity: 0.6; cursor: progress; }
   header h1 { font-size: 20px; margin: 0; font-weight: 600; letter-spacing: -0.01em; }
   header .search {
     position: relative; margin-left: 24px; flex: 0 1 360px;
@@ -1080,21 +1208,20 @@ DASHBOARD_HTML = r"""<!doctype html>
   header .search.has-query .clear { display: flex; }
   header .search.deep input { border-color: var(--accent-dim); }
   header .search.searching input { border-color: var(--accent); }
-  header .semantic-toggle {
-    font: inherit; font-size: 12px;
-    padding: 4px 10px; margin-left: 8px;
-    border-radius: 999px; border: 1px solid var(--border);
-    background: transparent; color: var(--fg-muted);
-    cursor: pointer; transition: all 120ms; white-space: nowrap;
+  header .semantic-status {
+    font: inherit; font-size: 11px; margin-left: 8px;
+    padding: 4px 10px;
+    border-radius: 999px; border: 1px solid var(--accent-dim);
+    background: rgba(122,162,247,0.08); color: var(--accent);
+    white-space: nowrap; display: none;
   }
-  header .semantic-toggle:hover { color: var(--fg); border-color: var(--accent-dim); }
-  header .semantic-toggle.active {
-    color: var(--accent); border-color: var(--accent);
-    background: rgba(122,162,247,0.08);
+  header .semantic-status.visible { display: inline-flex; align-items: center; gap: 6px; }
+  header .semantic-status .dot {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: var(--accent);
+    animation: cs-pulse 1.6s ease-in-out infinite;
   }
-  header .semantic-toggle[disabled] {
-    opacity: 0.45; cursor: not-allowed;
-  }
+  @keyframes cs-pulse { 0%, 100% { opacity: 0.4; } 50% { opacity: 1; } }
   .card.semantic-only {
     border-left: 3px solid #c084fc;
   }
@@ -1257,16 +1384,24 @@ DASHBOARD_HTML = r"""<!doctype html>
 </head>
 <body>
 <header>
-  <h1>Claude sessions</h1>
-  <div class="search" id="search">
-    <span class="icon">⌕</span>
-    <input id="search-input" type="search" placeholder="Search titles, prompts, replies…" autocomplete="off" spellcheck="false">
-    <button class="clear" id="search-clear" title="Clear (Esc)">×</button>
+  <div class="header-row">
+    <h1>Claude sessions</h1>
+    <div class="search" id="search">
+      <span class="icon">⌕</span>
+      <input id="search-input" type="search" placeholder="Search titles, prompts, replies…" autocomplete="off" spellcheck="false">
+      <button class="clear" id="search-clear" title="Clear (Esc)">×</button>
+    </div>
+    <span class="semantic-status" id="semantic-status" title="Embedding the rest of your sessions in the background. Lexical search keeps working — semantic ranking will start including these once they're indexed.">
+      <span class="dot"></span><span id="semantic-status-text">Indexing…</span>
+    </span>
+    <div class="meta">
+      <button class="hidden-toggle" id="hidden-toggle" style="display:none;">Show hidden (<span id="hidden-count">0</span>)</button>
+      <span id="status-line"><span id="session-count">—</span> sessions · last refresh <span id="refresh-ts">—</span></span>
+    </div>
   </div>
-  <button class="semantic-toggle" id="semantic-toggle" title="Also rank by semantic similarity (requires a configured embedding provider)">✨ Semantic</button>
-  <div class="meta">
-    <button class="hidden-toggle" id="hidden-toggle" style="display:none;">Show hidden (<span id="hidden-count">0</span>)</button>
-    <span id="status-line"><span id="session-count">—</span> sessions · last refresh <span id="refresh-ts">—</span></span>
+  <div class="index-warning" id="index-warning">
+    <span id="index-warning-text"></span>
+    <button id="index-wait" type="button">Wait for full index</button>
   </div>
 </header>
 <main id="grid"></main>
@@ -1283,7 +1418,31 @@ const toast = document.getElementById('toast');
 const searchWrap = document.getElementById('search');
 const searchInput = document.getElementById('search-input');
 const searchClear = document.getElementById('search-clear');
-const semanticToggle = document.getElementById('semantic-toggle');
+const semanticStatus = document.getElementById('semantic-status');
+const semanticStatusText = document.getElementById('semantic-status-text');
+const indexWarning = document.getElementById('index-warning');
+const indexWarningText = document.getElementById('index-warning-text');
+const indexWaitBtn = document.getElementById('index-wait');
+
+indexWaitBtn.addEventListener('click', async () => {
+  // Block on a sync reindex. The endpoint already exists for the CLI; we just
+  // call it and show progress while it runs. Once it returns, refresh()
+  // reruns the current query against the now-complete index.
+  const prevLabel = indexWaitBtn.textContent;
+  indexWaitBtn.disabled = true;
+  indexWaitBtn.textContent = 'Indexing…';
+  try {
+    const r = await fetch('/api/embed/reindex', {method: 'POST'});
+    if (!r.ok) throw new Error((await r.json()).error || r.statusText);
+    await refresh();
+    showToast('Index complete — semantic ranking now covers every session.', 'success');
+  } catch (e) {
+    showToast('Reindex failed: ' + e.message, 'error');
+  } finally {
+    indexWaitBtn.disabled = false;
+    indexWaitBtn.textContent = prevLabel;
+  }
+});
 
 function showToast(msg, kind) {
   toast.textContent = msg;
@@ -1310,15 +1469,12 @@ let deepQueryInFlight = '';
 // The query we've already attempted a deep search for (whether it returned
 // hits or not). Prevents re-firing the server roundtrip on each keystroke.
 let deepQueryAttempted = '';
-// Semantic-search opt-in. Persisted in localStorage so it survives refreshes.
-let semanticEnabled = (() => {
-  try { return localStorage.getItem('cs.semantic') === '1'; } catch (e) { return false; }
-})();
-// Latest semantic query we've requested — used to skip stale responses.
-let semanticQueryInFlight = '';
 
 function renderCards(data) {
   tsEl.textContent = new Date().toLocaleTimeString();
+  // Always update the indexing pill + warning to match what's on screen,
+  // including local-only re-renders that don't go through refresh().
+  applySemanticStatus(data);
   cachedWorkspaces = data.workspaces || [];
   // Prune stale selections — if a workspace was closed between refreshes,
   // drop the selection so the card falls back to "New workspace".
@@ -1623,10 +1779,13 @@ function onSearchInput() {
   deepQueryInFlight = '';
   clearTimeout(searchDebounce);
   searchDebounce = setTimeout(() => {
-    // Semantic mode needs a server roundtrip to recompute the ranking; pure
-    // lexical mode can re-render the cached payload locally for instant
-    // feedback while the next 10s poll catches any new sessions.
-    if (semanticEnabled && searchQuery) {
+    // When a semantic provider is configured, every keystroke needs a fresh
+    // server-side ranking (one Ollama call to embed the query + cosine over
+    // the cached vectors — ~300 ms on warm cache). When semantic is off,
+    // re-rendering the cached payload locally gives instant feedback and the
+    // next 10 s poll catches any new sessions.
+    const semanticOn = !!(lastPayload && lastPayload.semantic_provider);
+    if (semanticOn && searchQuery) {
       refresh();
     } else if (lastPayload) {
       renderCards(lastPayload);
@@ -1647,28 +1806,6 @@ searchClear.addEventListener('click', () => {
   searchInput.focus();
 });
 
-// Semantic toggle. Persists in localStorage. Triggers a refresh so the
-// server applies / removes semantic ranking immediately. Disabled state is
-// driven from the latest payload (data.semantic_provider).
-function applySemanticState() {
-  semanticToggle.classList.toggle('active', semanticEnabled);
-  const provider = (lastPayload && lastPayload.semantic_provider) || '';
-  if (!provider) {
-    semanticToggle.disabled = true;
-    semanticToggle.title = 'Semantic search is off. Set CLAUDE_DASHBOARD_EMBED=ollama (or openai) in the daemon environment to enable it.';
-  } else {
-    semanticToggle.disabled = false;
-    semanticToggle.title = 'Semantic ranking via ' + provider + '. Click to toggle.';
-  }
-}
-semanticToggle.addEventListener('click', () => {
-  if (semanticToggle.disabled) return;
-  semanticEnabled = !semanticEnabled;
-  try { localStorage.setItem('cs.semantic', semanticEnabled ? '1' : '0'); } catch (e) {}
-  applySemanticState();
-  refresh();
-});
-applySemanticState();
 // ⌘K / Ctrl+K / "/" focuses the search box.
 document.addEventListener('keydown', (e) => {
   if (document.activeElement === searchInput) return;
@@ -1738,23 +1875,21 @@ async function refresh() {
   pill.classList.add('refreshing');
   pillLabel.textContent = 'Refreshing…';
   try {
-    // Only ask for semantic ranking when the user has both the toggle on and
-    // a non-empty query — semantic without a query is meaningless and
-    // wastes a model round-trip on every poll.
+    // The query is included on every poll when one is active so the server
+    // can run semantic ranking automatically (whenever its provider is
+    // configured). Lexical-only mode just sends include_hidden — the server
+    // returns the full session list and the client filters it.
     const params = [];
     if (showHidden) params.push('include_hidden=1');
-    if (semanticEnabled && searchQuery) {
+    if (searchQuery) {
       params.push('q=' + encodeURIComponent(searchQuery));
       params.push('deep=1');
-      params.push('semantic=1');
-      semanticQueryInFlight = searchQuery;
     }
     const url = '/api/sessions' + (params.length ? '?' + params.join('&') : '');
     const r = await fetch(url);
     const data = await r.json();
     // Stale-response guard: only apply if user hasn't kept typing past us.
-    if (semanticEnabled && searchQuery
-        && data.query && data.query.toLowerCase() !== searchQuery) {
+    if (searchQuery && data.query && data.query.toLowerCase() !== searchQuery) {
       return;
     }
     lastPayload = data;
@@ -1762,7 +1897,6 @@ async function refresh() {
       showToast('Semantic backend error: ' + data.semantic_error, 'error');
     }
     renderCards(data);
-    applySemanticState();
     lastRefreshAt = Date.now();
   } catch (e) {
     console.error(e);
@@ -1770,6 +1904,63 @@ async function refresh() {
     refreshInFlight = false;
     pill.classList.remove('refreshing');
   }
+}
+
+// Status pill: visible only while indexing work is pending. Shows progress
+// (N/M) and an honest ETA when the warmer has measured throughput at least
+// once. Hidden in steady state.
+function applySemanticStatus(data) {
+  const provider = (data && data.semantic_provider) || '';
+  const pending = data ? (data.semantic_pending || 0) : 0;
+  const warming = data ? data.semantic_warming : false;
+  const indexed = data ? (data.semantic_indexed || 0) : 0;
+  const total = data ? (data.semantic_total || 0) : 0;
+  const sec = data ? (data.semantic_sec_per_embed || 0) : 0;
+  if (!provider || (!pending && !warming)) {
+    semanticStatus.classList.remove('visible');
+  } else {
+    semanticStatus.classList.add('visible');
+    let txt = 'Indexing ' + indexed + '/' + total;
+    if (sec > 0 && pending > 0) {
+      txt += ' · ' + formatEta(pending * sec);
+    } else if (pending > 0) {
+      // No throughput sample yet — fall back to a vague hint instead of
+      // making up a number.
+      txt += ' · estimating…';
+    }
+    semanticStatusText.textContent = txt;
+  }
+  applyIndexWarning(data);
+}
+
+// Inline warning under the search bar. Visible only when the user has a
+// query active AND some sessions still aren't in the semantic index. The
+// "Wait for full index" button blocks on a sync reindex and re-runs the
+// search once everything is indexed.
+function applyIndexWarning(data) {
+  const provider = (data && data.semantic_provider) || '';
+  const pending = data ? (data.semantic_pending || 0) : 0;
+  const total = data ? (data.semantic_total || 0) : 0;
+  if (!provider || !searchQuery || !pending || !total) {
+    indexWarning.classList.remove('visible');
+    return;
+  }
+  const sec = data.semantic_sec_per_embed || 0;
+  const eta = sec > 0 ? ' (~' + formatEta(pending * sec) + ' to finish)' : '';
+  indexWarningText.textContent =
+    'Semantic ranking is missing ' + pending + ' of ' + total
+    + ' sessions' + eta + '. Lexical results below are complete; the missing sessions could only be reached via embedding similarity.';
+  indexWarning.classList.add('visible');
+}
+
+function formatEta(seconds) {
+  if (!isFinite(seconds) || seconds < 0) return '';
+  if (seconds < 1.5) return 'about 1s';
+  if (seconds < 60) return Math.round(seconds) + 's';
+  const m = Math.floor(seconds / 60);
+  const s = Math.round(seconds % 60);
+  if (m < 10) return m + 'm ' + s + 's';
+  return m + 'm';
 }
 
 async function hideCard(s, cardEl) {
@@ -1882,8 +2073,7 @@ class Handler(BaseHTTPRequestHandler):
                 include_hidden = qs.get("include_hidden", ["0"])[0] in ("1", "true", "yes")
                 query = qs.get("q", [""])[0]
                 deep = qs.get("deep", ["0"])[0] in ("1", "true", "yes")
-                semantic = qs.get("semantic", ["0"])[0] in ("1", "true", "yes")
-                payload = build_payload(include_hidden=include_hidden, query=query, deep=deep, semantic=semantic)
+                payload = build_payload(include_hidden=include_hidden, query=query, deep=deep)
                 self._send_json(200, payload)
             except Exception as e:
                 traceback.print_exc()
@@ -1996,6 +2186,10 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
+    # Start the embedding warmer in the background so semantic search is
+    # ready by the time the user types a query (or, on cold install, ~25s
+    # later for a 500-session corpus). No-op when no provider is configured.
+    _start_warmer_if_configured()
     srv = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     print(f"claude-dashboard listening on http://127.0.0.1:{PORT}", flush=True)
     try:

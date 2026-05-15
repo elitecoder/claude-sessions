@@ -43,19 +43,20 @@ If the existing workspace already has a Claude session running, the button turns
 
 ![Search — deep transcript match](docs/images/search-deep.png)
 
-Three tiers, all opt-in to escalate further:
+Three tiers, automatic — type the words you remember and the right tier kicks in:
 
 - **Shallow (instant):** filters the cards you already see against title, kickoff prompt, last prompt, last reply, and cwd. Zero round-trips, debounced 120 ms, with the matched substring highlighted everywhere it appears.
 - **Deep (automatic fallback):** if shallow returns nothing, the dashboard greps the full JSONL bodies server-side and pulls in any session whose transcript contains the query. Each transcript hit renders a highlighted snippet below the usual previews so you can eyeball the match in context. Haystacks cache per-file by mtime, so repeated searches are effectively free.
-- **Semantic (✨ toggle):** flip the **✨ Semantic** pill in the header to also rank by embedding similarity. Lexical results stay first; semantically-related sessions get pulled in alongside them via [Reciprocal Rank Fusion](https://www.cs.uwaterloo.ca/~gvcormac/cormacksigir09-rrf.pdf). Each "no exact word match" hit is labelled with a purple `match · semantic` row so you know why it's there. Off by default; set `CLAUDE_DASHBOARD_EMBED=ollama` (recommended, fully local) or `CLAUDE_DASHBOARD_EMBED=openai` to enable.
+- **Semantic (always-on when configured):** when an embedding provider is set, every query is *also* ranked by embedding similarity. Lexical results stay first; semantically-related sessions get pulled in alongside them via [Reciprocal Rank Fusion](https://www.cs.uwaterloo.ca/~gvcormac/cormacksigir09-rrf.pdf). Each "no exact word match" hit is labelled with a purple `match · semantic` row so you know why it's there. Embeddings are built in the background — a small pill in the header shows progress (`Indexing 124/525 · 22s`) until the index is complete, and the search bar grows an amber warning while a query is active and the index isn't yet covering everything (with a one-click "Wait for full index" button if you want certainty).
 
-In other words: type a phrase you remember saying, type a phrase Claude said back, type a path or a stack-trace fragment — they all work via lexical search alone. Toggle Semantic on when you remember the *idea* of a session but not the words.
+In other words: type a phrase you remember saying, type a phrase Claude said back, type a path or a stack-trace fragment, or type the *idea* of a session even if you don't remember the words — the right retriever fires automatically and the rest stay out of your way.
 
 ![Search — semantic match](docs/images/search-semantic.png)
+![Search — index still warming](docs/images/search-indexing.png)
 
 ### Semantic search setup
 
-Semantic search is opt-in because it needs a local embedding model running. The recipe assumes [Ollama](https://ollama.com), which is the simplest local option:
+Off by default — flip on with one env var once you have an embedding provider running. The simplest local option is [Ollama](https://ollama.com):
 
 ```bash
 brew install ollama
@@ -69,10 +70,9 @@ plist=~/Library/LaunchAgents/com.$USER.claude-dashboard.plist
 #   <key>CLAUDE_DASHBOARD_EMBED</key>
 #   <string>ollama</string>
 launchctl bootstrap gui/$(id -u) "$plist"
-
-# Build the embedding cache (~25 s for 500 sessions on M-series)
-claude-dashboard-ctl reindex
 ```
+
+That's it. The daemon spawns a background warmer thread on startup that embeds every session in batches; lexical search keeps working the whole time and semantic ranking starts including each session as soon as its embedding lands. Pre-warm the cache up front with `claude-dashboard-ctl reindex` (~25 s for 500 sessions on M-series) if you want zero "indexing…" pill on the next reload, or just let the warmer drain on its own.
 
 The cache lives at `~/.claude/cmux-dashboard-embeddings.sqlite`, keyed by `(provider, model, content_hash)`, so it survives daemon restarts and only re-embeds sessions whose summary text actually changes. Drop it any time with `claude-dashboard-ctl evict-embeddings`.
 
