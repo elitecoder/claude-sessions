@@ -1868,9 +1868,17 @@ const pill = document.getElementById('refresh-pill');
 const pillLabel = document.getElementById('refresh-pill-label');
 let lastRefreshAt = 0;
 let refreshInFlight = false;
+// If a refresh is requested while one is already running (very common: a
+// search keystroke lands during the 10s poll), queue exactly one more pass
+// to run as soon as the current one finishes. We don't queue more than one —
+// the latest searchQuery at completion time is what matters, not history.
+let refreshQueued = false;
 
 async function refresh() {
-  if (refreshInFlight) return;
+  if (refreshInFlight) {
+    refreshQueued = true;
+    return;
+  }
   refreshInFlight = true;
   pill.classList.add('refreshing');
   pillLabel.textContent = 'Refreshing…';
@@ -1889,7 +1897,8 @@ async function refresh() {
     const r = await fetch(url);
     const data = await r.json();
     // Stale-response guard: only apply if user hasn't kept typing past us.
-    if (searchQuery && data.query && data.query.toLowerCase() !== searchQuery) {
+    if (searchQuery && data.query !== undefined
+        && (data.query || '').toLowerCase() !== searchQuery) {
       return;
     }
     lastPayload = data;
@@ -1903,6 +1912,11 @@ async function refresh() {
   } finally {
     refreshInFlight = false;
     pill.classList.remove('refreshing');
+    if (refreshQueued) {
+      refreshQueued = false;
+      // Tail call — pick up whatever the user typed during our await.
+      refresh();
+    }
   }
 }
 
