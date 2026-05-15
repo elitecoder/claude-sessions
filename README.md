@@ -38,6 +38,13 @@ Each card shows:
 
 If the existing workspace already has a Claude session running, the button turns amber and you get a confirm dialog before it nukes the old one. You don't have to read the code to know when you're about to shoot yourself in the foot.
 
+**Search it** — hit `⌘K` (or `/`) and start typing. `Esc` clears.
+
+![Search — deep transcript match](docs/images/search-deep.png)
+
+- **Shallow (instant):** filters the cards you already see against title, kickoff prompt, last prompt, last reply, and cwd. Zero round-trips, debounced 120ms.
+- **Deep (automatic fallback):** if shallow returns nothing, the dashboard greps the full JSONL bodies server-side and pulls in any session whose transcript contains the query. Each transcript hit renders a highlighted snippet below the usual previews so you can eyeball the match in context. Haystacks cache per-file by mtime, so repeated searches are effectively free.
+
 **Other goodies in the box:**
 
 - `cmux-resume` — a terminal picker, same idea, no browser required.

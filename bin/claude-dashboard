@@ -40,6 +40,41 @@ MAX_SESSIONS = int(os.environ.get("CLAUDE_DASHBOARD_MAX") or "5000")
 _PARSE_CACHE = {}
 _PARSE_CACHE_LOCK = __import__("threading").Lock()
 
+# Short-TTL cache of the filesystem scan. Enumerating + stat'ing every JSONL
+# under ~/.claude/projects is the real cost on corpora of thousands of files
+# (seconds on cold FS cache). The browser polls /api/sessions every 10s, so
+# anything tighter than that wastes work — cache for a few seconds and let
+# the next poll pay the scan cost.
+_FSLIST_CACHE = None           # (timestamp, [(path, mtime), ...])
+_FSLIST_CACHE_LOCK = __import__("threading").Lock()
+FSLIST_TTL_SECONDS = 3.0
+
+# Deep-search haystack cache: path -> (mtime, lowercased_text). Built lazily
+# on first deep query; cached by mtime like the parse cache. We only keep the
+# lowercased form and re-derive the snippet from file contents at render time
+# (there are at most len(sessions) snippets per response, so it's cheap).
+_HAYSTACK_CACHE = {}
+_HAYSTACK_CACHE_LOCK = __import__("threading").Lock()
+# Per-session haystack cap — keeps memory bounded on giant transcripts.
+HAYSTACK_MAX_CHARS = 1_000_000
+# Thread pool used to build haystacks in parallel for deep search. File I/O
+# drops the GIL, so even with CPython this gives a real speedup on cold cache.
+_HAYSTACK_POOL = None
+_HAYSTACK_POOL_LOCK = __import__("threading").Lock()
+
+
+def _haystack_pool():
+    global _HAYSTACK_POOL
+    if _HAYSTACK_POOL is not None:
+        return _HAYSTACK_POOL
+    with _HAYSTACK_POOL_LOCK:
+        if _HAYSTACK_POOL is None:
+            from concurrent.futures import ThreadPoolExecutor
+            _HAYSTACK_POOL = ThreadPoolExecutor(
+                max_workers=16, thread_name_prefix="haystack"
+            )
+    return _HAYSTACK_POOL
+
 
 def _extract_user_text(j):
     if j.get("type") != "user":
@@ -251,29 +286,208 @@ def active_session_ids(registry, ws_live):
     }
 
 
-def collect_sessions():
-    files = []
+def _list_session_files():
+    """Enumerate JSONL files and capture their mtimes. Cached with a short TTL
+    so rapid-fire requests (browser poll + a manual search) share one scan."""
+    global _FSLIST_CACHE
+    now = time.time()
+    with _FSLIST_CACHE_LOCK:
+        if _FSLIST_CACHE and now - _FSLIST_CACHE[0] < FSLIST_TTL_SECONDS:
+            return _FSLIST_CACHE[1]
+    entries = []
     for p in glob.glob(os.path.join(SESSIONS_DIR, "*", "*.jsonl")):
         if "/subagents/" in p:
             continue
-        files.append(p)
-    files.sort(key=os.path.getmtime, reverse=True)
-    # MAX_SESSIONS is a runaway-safety cap (default 5000), not a feature.
-    files = files[:MAX_SESSIONS]
+        try:
+            entries.append((p, os.path.getmtime(p)))
+        except OSError:
+            pass
+    entries.sort(key=lambda e: e[1], reverse=True)
+    entries = entries[:MAX_SESSIONS]
+    with _FSLIST_CACHE_LOCK:
+        _FSLIST_CACHE = (now, entries)
+    return entries
+
+
+def collect_sessions():
+    entries = _list_session_files()
+
+    # Separate cache-hits from cache-misses. Hot paths use the mtime we just
+    # captured; cold paths pay the parse cost.
+    hot = {}
+    cold = []
+    for p, mtime in entries:
+        with _PARSE_CACHE_LOCK:
+            cached = _PARSE_CACHE.get(p)
+        if cached and cached[0] == mtime:
+            hot[p] = cached[1]
+        else:
+            cold.append(p)
+
+    cold_parsed = {}
+    if cold:
+        pool = _haystack_pool()
+        futures = {pool.submit(parse_session, p): p for p in cold}
+        for f in futures:
+            p = futures[f]
+            try:
+                cold_parsed[p] = f.result()
+            except Exception:
+                cold_parsed[p] = None
+
     parsed = []
-    for p in files:
-        s = parse_session(p)
+    for p, _ in entries:
+        s = hot.get(p) or cold_parsed.get(p)
         if s is not None:
+            s["path"] = p
             parsed.append(s)
     return parsed
 
 
-def build_payload(include_hidden=False):
+def _build_haystack(path):
+    """Read a JSONL and produce a lowercased concatenation of user+assistant
+    text, capped at HAYSTACK_MAX_CHARS. Returns '' on read errors."""
+    chunks = []
+    total = 0
+    try:
+        with open(path, "r", errors="replace") as fh:
+            for line in fh:
+                try:
+                    j = json.loads(line)
+                except Exception:
+                    continue
+                t = _extract_user_text(j) or _extract_assistant_text(j)
+                if not t:
+                    continue
+                chunks.append(t)
+                total += len(t) + 1
+                if total >= HAYSTACK_MAX_CHARS:
+                    break
+    except Exception:
+        return ""
+    return "\n".join(chunks).lower()
+
+
+def _load_haystack(path):
+    """Return the lowercased haystack for one path, using the mtime cache."""
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return ""
+    with _HAYSTACK_CACHE_LOCK:
+        cached = _HAYSTACK_CACHE.get(path)
+        if cached and cached[0] == mtime:
+            return cached[1]
+    lower = _build_haystack(path)
+    with _HAYSTACK_CACHE_LOCK:
+        _HAYSTACK_CACHE[path] = (mtime, lower)
+    return lower
+
+
+def _warm_haystacks(paths):
+    """Warm the haystack cache for a list of paths in parallel. Missing or
+    stale entries are built via a thread pool so cold deep searches don't
+    serialize on 2000+ sequential file reads."""
+    todo = []
+    for p in paths:
+        try:
+            mtime = os.path.getmtime(p)
+        except OSError:
+            continue
+        with _HAYSTACK_CACHE_LOCK:
+            cached = _HAYSTACK_CACHE.get(p)
+            if cached and cached[0] == mtime:
+                continue
+        todo.append(p)
+    if not todo:
+        return
+    pool = _haystack_pool()
+    futures = [pool.submit(_load_haystack, p) for p in todo]
+    for f in futures:
+        try:
+            f.result()
+        except Exception:
+            pass
+
+
+def _snippet_from_file(path, q_lower, width=140):
+    """Read the JSONL and return a short snippet around the first hit, or ''.
+    Called only for sessions we already know match (so at most the rendered
+    count of files are opened per response)."""
+    q_len = len(q_lower)
+    try:
+        with open(path, "r", errors="replace") as fh:
+            for line in fh:
+                try:
+                    j = json.loads(line)
+                except Exception:
+                    continue
+                t = _extract_user_text(j) or _extract_assistant_text(j)
+                if not t:
+                    continue
+                idx = t.lower().find(q_lower)
+                if idx >= 0:
+                    return _snippet_around(t, idx, q_len, width=width)
+    except Exception:
+        pass
+    return ""
+
+
+def _snippet_around(full, idx, q_len, width=140):
+    """Return a short snippet centered on idx, with a leading/trailing ellipsis
+    when truncated. Collapses runs of whitespace for readability."""
+    half = max(0, (width - q_len) // 2)
+    start = max(0, idx - half)
+    end = min(len(full), idx + q_len + half)
+    snippet = full[start:end]
+    snippet = re.sub(r"\s+", " ", snippet).strip()
+    if start > 0:
+        snippet = "…" + snippet
+    if end < len(full):
+        snippet = snippet + "…"
+    return snippet
+
+
+def _match_shallow(s, q_lower):
+    """Return (field_name, idx_in_preview) or None. Checks the cheap preview
+    fields that the client already has — used server-side for consistent
+    behavior when a query is supplied."""
+    for field in ("ai_title", "first_user", "last_user", "last_assistant", "cwd"):
+        v = s.get(field) or ""
+        if not v:
+            continue
+        idx = v.lower().find(q_lower)
+        if idx >= 0:
+            return field, idx
+    return None
+
+
+def _match_deep(s, q_lower):
+    """Full-transcript search. Returns a snippet string, or None.
+
+    Lookup happens in two steps: a fast substring check against the cached
+    lowercased haystack (already warmed by _warm_haystacks), and — only for
+    hits — a second short scan of the file to produce a human-readable
+    snippet from original-case text."""
+    path = s.get("path")
+    if not path:
+        return None
+    lower = _load_haystack(path)
+    if not lower or q_lower not in lower:
+        return None
+    return _snippet_from_file(path, q_lower) or "(match)"
+
+
+def build_payload(include_hidden=False, query="", deep=False):
     sessions = collect_sessions()
     registry = load_registry()
     ws_live = live_workspaces()
     active_ids = active_session_ids(registry, ws_live)
     hidden_ids = load_hidden()
+    q_lower = (query or "").strip().lower()
+    if q_lower and deep:
+        # Parallel warm-up so 2000+ cold file reads don't serialize.
+        _warm_haystacks([s["path"] for s in sessions if "path" in s])
 
     # session_id -> (workspace_id, workspace_title)
     sess_to_ws = {}
@@ -302,12 +516,30 @@ def build_payload(include_hidden=False):
 
     out = []
     hidden_count = 0
+    deep_hits = 0
     for s in sessions:
         is_hidden = s["sess"] in hidden_ids
         if is_hidden:
             hidden_count += 1
             if not include_hidden:
                 continue
+
+        snippet = ""
+        matched_field = ""
+        if q_lower:
+            shallow = _match_shallow(s, q_lower)
+            if shallow:
+                matched_field = shallow[0]
+            elif deep:
+                snippet = _match_deep(s, q_lower) or ""
+                if snippet:
+                    matched_field = "transcript"
+                    deep_hits += 1
+                else:
+                    continue
+            else:
+                continue
+
         title = s["ai_title"] or (s["first_user"][:60] if s["first_user"] else s["sess"][:8])
         title = title[:90]
         ws_match = sess_to_ws.get(s["sess"])
@@ -327,6 +559,8 @@ def build_payload(include_hidden=False):
             "workspace_id": ws_match[0] if ws_match else "",
             "workspace_title": ws_match[1] if ws_match else "",
             "hidden": is_hidden,
+            "matched_field": matched_field,
+            "snippet": snippet,
         })
     return {
         "generated_at": datetime.datetime.now().isoformat(timespec="seconds"),
@@ -334,6 +568,9 @@ def build_payload(include_hidden=False):
         "workspaces": workspaces_list,
         "hidden_count": hidden_count,
         "include_hidden": include_hidden,
+        "query": query,
+        "deep": deep,
+        "deep_hits": deep_hits,
     }
 
 
@@ -474,7 +711,47 @@ DASHBOARD_HTML = r"""<!doctype html>
   html, body { margin: 0; padding: 0; font-family: -apple-system, "SF Pro Text", system-ui, sans-serif; background: var(--bg); color: var(--fg); }
   header { padding: 24px 32px 12px; display: flex; align-items: baseline; gap: 16px; border-bottom: 1px solid var(--border); }
   header h1 { font-size: 20px; margin: 0; font-weight: 600; letter-spacing: -0.01em; }
+  header .search {
+    position: relative; margin-left: 24px; flex: 0 1 360px;
+  }
+  header .search input {
+    width: 100%; font: inherit; font-size: 13px;
+    background: var(--bg-elev); color: var(--fg);
+    border: 1px solid var(--border); border-radius: 999px;
+    padding: 7px 30px 7px 32px; outline: none;
+    transition: border-color 120ms, background 120ms;
+  }
+  header .search input:focus { border-color: var(--accent); background: var(--bg-card); }
+  header .search .icon {
+    position: absolute; left: 11px; top: 50%; transform: translateY(-50%);
+    font-size: 13px; color: var(--fg-muted); pointer-events: none;
+  }
+  header .search .clear {
+    position: absolute; right: 8px; top: 50%; transform: translateY(-50%);
+    width: 18px; height: 18px; padding: 0;
+    border: 0; border-radius: 50%;
+    background: transparent; color: var(--fg-muted); font: inherit;
+    cursor: pointer; display: none; align-items: center; justify-content: center;
+    line-height: 1;
+  }
+  header .search .clear:hover { color: var(--fg); background: var(--bg-hover); }
+  header .search.has-query .clear { display: flex; }
+  header .search.deep input { border-color: var(--accent-dim); }
+  header .search.searching input { border-color: var(--accent); }
   header .meta { color: var(--fg-muted); font-size: 13px; margin-left: auto; display: flex; align-items: center; gap: 16px; }
+  .card .match-hit {
+    font-size: 12px; color: var(--fg-muted);
+    background: rgba(122,162,247,0.06);
+    border-left: 2px solid var(--accent-dim);
+    padding: 6px 8px; border-radius: 4px; margin: 2px 0;
+    line-height: 1.4;
+  }
+  .card .match-hit b { color: var(--accent); font-weight: 600; margin: 0; }
+  .card .match-hit .label {
+    font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em;
+    color: var(--fg-muted); opacity: 0.7; margin-right: 6px;
+  }
+  mark.qhit { background: rgba(224, 175, 104, 0.28); color: var(--fg); padding: 0 2px; border-radius: 2px; }
   header .hidden-toggle {
     color: var(--fg-muted); font-size: 12px; cursor: pointer;
     padding: 4px 10px; border-radius: 999px; border: 1px solid var(--border);
@@ -617,9 +894,14 @@ DASHBOARD_HTML = r"""<!doctype html>
 <body>
 <header>
   <h1>Claude sessions</h1>
+  <div class="search" id="search">
+    <span class="icon">⌕</span>
+    <input id="search-input" type="search" placeholder="Search titles, prompts, replies…" autocomplete="off" spellcheck="false">
+    <button class="clear" id="search-clear" title="Clear (Esc)">×</button>
+  </div>
   <div class="meta">
     <button class="hidden-toggle" id="hidden-toggle" style="display:none;">Show hidden (<span id="hidden-count">0</span>)</button>
-    <span><span id="session-count">—</span> sessions · last refresh <span id="refresh-ts">—</span></span>
+    <span id="status-line"><span id="session-count">—</span> sessions · last refresh <span id="refresh-ts">—</span></span>
   </div>
 </header>
 <main id="grid"></main>
@@ -633,6 +915,9 @@ const grid = document.getElementById('grid');
 const countEl = document.getElementById('session-count');
 const tsEl = document.getElementById('refresh-ts');
 const toast = document.getElementById('toast');
+const searchWrap = document.getElementById('search');
+const searchInput = document.getElementById('search-input');
+const searchClear = document.getElementById('search-clear');
 
 function showToast(msg, kind) {
   toast.textContent = msg;
@@ -647,8 +932,20 @@ const selectionState = new Map();
 // "Show hidden" toggle (in-memory; doesn't persist across page reloads)
 let showHidden = false;
 
+// Current search query (lowercased). Empty string = no filter.
+let searchQuery = '';
+// Cache of the latest unfiltered payload so typing doesn't need to refetch.
+let lastPayload = null;
+// Deep-search results: session_id -> {snippet, matched_field}. Populated only
+// when the shallow client-side filter returned 0 hits.
+let deepHits = new Map();
+// Latest deep-search query string so we can ignore stale responses.
+let deepQueryInFlight = '';
+// The query we've already attempted a deep search for (whether it returned
+// hits or not). Prevents re-firing the server roundtrip on each keystroke.
+let deepQueryAttempted = '';
+
 function renderCards(data) {
-  countEl.textContent = data.sessions.length;
   tsEl.textContent = new Date().toLocaleTimeString();
   cachedWorkspaces = data.workspaces || [];
   // Prune stale selections — if a workspace was closed between refreshes,
@@ -659,6 +956,48 @@ function renderCards(data) {
   }
   if (!data.sessions.length) {
     grid.innerHTML = '<div class="empty">No Claude sessions found.</div>';
+    countEl.textContent = 0;
+    return;
+  }
+
+  // Client-side filter. Runs on every render so it applies after each 10s
+  // refresh too. Matches title, kickoff, last prompt, last reply, and cwd.
+  const q = searchQuery;
+  const showing = [];
+  for (const s of data.sessions) {
+    if (!q) { showing.push(s); continue; }
+    const hay = [
+      s.title || '',
+      s.kickoff || '',
+      s.latest_user || '',
+      s.latest_assistant || '',
+      s.cwd || '',
+    ].join('  ').toLowerCase();
+    const idx = hay.indexOf(q);
+    if (idx >= 0) {
+      showing.push({...s, _matchedShallow: true});
+      continue;
+    }
+    const deep = deepHits.get(s.sess);
+    if (deep) {
+      showing.push({...s, _deepSnippet: deep.snippet, _matchedField: deep.matched_field});
+    }
+  }
+  countEl.textContent = showing.length + (q ? ' / ' + data.sessions.length : '');
+
+  if (!showing.length) {
+    const msg = q
+      ? (deepQueryInFlight === q
+          ? 'Searching full transcripts for “' + escapeHtml(q) + '”…'
+          : 'No matches for “' + escapeHtml(q) + '”.')
+      : 'No Claude sessions found.';
+    grid.innerHTML = '<div class="empty">' + msg + '</div>';
+    // If we have a query but nothing matched shallow and deep isn't in flight,
+    // trigger a deep search. It's idempotent — if we already tried, the
+    // deepHits map will be populated (even if empty).
+    if (q && deepQueryAttempted !== q && deepQueryInFlight !== q) {
+      runDeepSearch(q);
+    }
     return;
   }
   // Update hidden-count chip in header
@@ -681,7 +1020,7 @@ function renderCards(data) {
   }
 
   const frag = document.createDocumentFragment();
-  for (const s of data.sessions) {
+  for (const s of showing) {
     const card = document.createElement('div');
     card.className = 'card' + (s.active ? ' active' : '') + (s.hidden ? ' is-hidden' : '');
     // Hide (×) button — only for non-hidden cards; hidden cards get a Restore button in actions row
@@ -698,7 +1037,11 @@ function renderCards(data) {
     titleRow.className = 'title-row';
     const title = document.createElement('div');
     title.className = 'title';
-    title.textContent = s.title;
+    if (searchQuery) {
+      title.innerHTML = hilite(s.title);
+    } else {
+      title.textContent = s.title;
+    }
     titleRow.appendChild(title);
     const status = document.createElement('span');
     status.className = 'status';
@@ -729,18 +1072,26 @@ function renderCards(data) {
     preview.className = 'preview';
     if (s.kickoff) {
       const p = document.createElement('p');
-      p.innerHTML = '<b>kickoff</b>' + escapeHtml(s.kickoff);
+      p.innerHTML = '<b>kickoff</b>' + hilite(s.kickoff);
       preview.appendChild(p);
     }
     if (s.latest_user && s.latest_user !== s.kickoff) {
       const p = document.createElement('p');
-      p.innerHTML = '<b>last prompt</b>' + escapeHtml(s.latest_user);
+      p.innerHTML = '<b>last prompt</b>' + hilite(s.latest_user);
       preview.appendChild(p);
     }
     if (s.latest_assistant) {
       const p = document.createElement('p');
-      p.innerHTML = '<b>last reply</b>' + escapeHtml(s.latest_assistant);
+      p.innerHTML = '<b>last reply</b>' + hilite(s.latest_assistant);
       preview.appendChild(p);
+    }
+    // Deep-search hit: show the transcript snippet in its own styled row so
+    // it's obvious this match came from the body, not the preview fields.
+    if (s._deepSnippet) {
+      const hit = document.createElement('div');
+      hit.className = 'match-hit';
+      hit.innerHTML = '<span class="label">match · transcript</span>' + hilite(s._deepSnippet);
+      preview.appendChild(hit);
     }
     card.appendChild(preview);
 
@@ -819,6 +1170,88 @@ function escapeHtml(s) {
   return (s || '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
+// Escape a string for safe literal use in a RegExp.
+function regexEscape(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+
+// Escape text for HTML, then wrap case-insensitive occurrences of searchQuery
+// in <mark class="qhit">. Returns safe HTML.
+function hilite(text) {
+  const esc = escapeHtml(text || '');
+  if (!searchQuery) return esc;
+  const pat = new RegExp('(' + regexEscape(escapeHtml(searchQuery)) + ')', 'gi');
+  return esc.replace(pat, '<mark class="qhit">$1</mark>');
+}
+
+// Run the deep (server-side) transcript search. Only fires when the shallow
+// filter returned nothing, and at most once per distinct query.
+async function runDeepSearch(q) {
+  deepQueryInFlight = q;
+  searchWrap.classList.add('searching');
+  try {
+    const url = '/api/sessions?q=' + encodeURIComponent(q)
+      + '&deep=1'
+      + (showHidden ? '&include_hidden=1' : '');
+    const r = await fetch(url);
+    const data = await r.json();
+    // If the user kept typing, this response is stale — drop it.
+    if (searchQuery !== q) return;
+    deepHits = new Map();
+    for (const s of (data.sessions || [])) {
+      if (s.snippet) {
+        deepHits.set(s.sess, {snippet: s.snippet, matched_field: s.matched_field});
+      }
+    }
+    deepQueryAttempted = q;
+    if (lastPayload) renderCards(lastPayload);
+  } catch (e) {
+    console.error('deep search failed', e);
+  } finally {
+    if (deepQueryInFlight === q) deepQueryInFlight = '';
+    searchWrap.classList.remove('searching');
+  }
+}
+
+// Debounced search-box handler.
+let searchDebounce = null;
+function onSearchInput() {
+  const raw = searchInput.value.trim();
+  const next = raw.toLowerCase();
+  searchWrap.classList.toggle('has-query', !!next);
+  if (next === searchQuery) return;
+  searchQuery = next;
+  // New query resets deep state — previous hits aren't valid any more.
+  deepHits = new Map();
+  deepQueryAttempted = '';
+  deepQueryInFlight = '';
+  clearTimeout(searchDebounce);
+  searchDebounce = setTimeout(() => {
+    if (lastPayload) renderCards(lastPayload);
+  }, 120);
+}
+searchInput.addEventListener('input', onSearchInput);
+searchInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') {
+    searchInput.value = '';
+    onSearchInput();
+    searchInput.blur();
+  }
+});
+searchClear.addEventListener('click', () => {
+  searchInput.value = '';
+  onSearchInput();
+  searchInput.focus();
+});
+// ⌘K / Ctrl+K / "/" focuses the search box.
+document.addEventListener('keydown', (e) => {
+  if (document.activeElement === searchInput) return;
+  const isMod = e.metaKey || e.ctrlKey;
+  if ((isMod && e.key.toLowerCase() === 'k') || (!isMod && e.key === '/')) {
+    e.preventDefault();
+    searchInput.focus();
+    searchInput.select();
+  }
+});
+
 async function resumeSession(s, btn, targetWorkspaceId) {
   if (targetWorkspaceId) {
     const w = cachedWorkspaces.find(x => x.id === targetWorkspaceId);
@@ -880,6 +1313,7 @@ async function refresh() {
     const url = '/api/sessions' + (showHidden ? '?include_hidden=1' : '');
     const r = await fetch(url);
     const data = await r.json();
+    lastPayload = data;
     renderCards(data);
     lastRefreshAt = Date.now();
   } catch (e) {
@@ -998,7 +1432,9 @@ class Handler(BaseHTTPRequestHandler):
                 from urllib.parse import urlparse, parse_qs
                 qs = parse_qs(urlparse(self.path).query)
                 include_hidden = qs.get("include_hidden", ["0"])[0] in ("1", "true", "yes")
-                payload = build_payload(include_hidden=include_hidden)
+                query = qs.get("q", [""])[0]
+                deep = qs.get("deep", ["0"])[0] in ("1", "true", "yes")
+                payload = build_payload(include_hidden=include_hidden, query=query, deep=deep)
                 self._send_json(200, payload)
             except Exception as e:
                 traceback.print_exc()
