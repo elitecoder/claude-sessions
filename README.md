@@ -28,6 +28,7 @@ Each card shows:
 - 💬  Kickoff prompt · last prompt · last reply — so you can identify sessions at a glance, not just by name
 - 🟢  Green border when the session is live in a cmux workspace
 - 🟨  Amber warning when you're about to do something destructive
+- 🔍  Searchable by keyword — across titles, previews, **and** the full JSONL transcript when you need it
 
 ## What it does
 
@@ -42,8 +43,12 @@ If the existing workspace already has a Claude session running, the button turns
 
 ![Search — deep transcript match](docs/images/search-deep.png)
 
-- **Shallow (instant):** filters the cards you already see against title, kickoff prompt, last prompt, last reply, and cwd. Zero round-trips, debounced 120ms.
+Two-stage, no config:
+
+- **Shallow (instant):** filters the cards you already see against title, kickoff prompt, last prompt, last reply, and cwd. Zero round-trips, debounced 120 ms, with the matched substring highlighted everywhere it appears.
 - **Deep (automatic fallback):** if shallow returns nothing, the dashboard greps the full JSONL bodies server-side and pulls in any session whose transcript contains the query. Each transcript hit renders a highlighted snippet below the usual previews so you can eyeball the match in context. Haystacks cache per-file by mtime, so repeated searches are effectively free.
+
+In other words: type a phrase you remember saying, type a phrase Claude said back, type a path or a stack-trace fragment — they all work, and you don't have to know up front which one will hit.
 
 **Other goodies in the box:**
 
@@ -113,23 +118,26 @@ Reverses everything. Your session data is untouched — it lives in `~/.claude/p
 │                                                                 │
 │  GET  /            → dashboard HTML (polls every 10s)           │
 │  GET  /api/sessions → reads all JSONLs + the registry,          │
-│                       cross-references them, returns cards      │
+│                       cross-references them, returns cards.     │
+│                       ?q=…&deep=1 greps full transcripts.       │
 │  POST /api/resume   → shells out to cmux:                       │
 │                       • new-workspace + rename-workspace, OR    │
 │                       • respawn-pane + rename-workspace         │
+│  POST /api/hide     → mark a session card hidden                │
+│  POST /api/unhide   → restore a hidden card                     │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-Two pieces, no database, no background indexing, no cloud. The registry is a single JSON file. The dashboard reads files on disk on every request (fast enough for <100 sessions — my own use peaks around 60).
+Two pieces, no database, no background indexing, no cloud. The registry is a single JSON file. The dashboard reads files on disk, but every layer is mtime-cached: the directory scan is held for a few seconds, parsed sessions stay until their JSONL changes, and deep-search transcripts cache the same way. Cold start parallelizes JSONL parsing across a 16-thread pool. In practice this comfortably handles a few thousand sessions on a laptop — my own corpus is past 500 and a refresh round-trip stays under half a second.
 
 ## Configuration
 
 All optional:
 
-| Env var                     | Default  | What it does                                     |
-| --------------------------- | -------- | ------------------------------------------------ |
-| `CLAUDE_DASHBOARD_PORT`     | `18577`  | HTTP port. Changes require editing the plist.    |
-| `CLAUDE_DASHBOARD_MAX`      | `60`     | Max sessions shown on the dashboard.             |
+| Env var                     | Default  | What it does                                                                                |
+| --------------------------- | -------- | ------------------------------------------------------------------------------------------- |
+| `CLAUDE_DASHBOARD_PORT`     | `18577`  | HTTP port. Changes require editing the plist.                                               |
+| `CLAUDE_DASHBOARD_MAX`      | `5000`   | Hard cap on sessions considered (newest-first by mtime). Runaway-safety, not a feature cap. |
 
 ## Limitations and sharp edges
 
@@ -144,7 +152,7 @@ I'd rather tell you these up front than let you find them during a bad day.
 ## Acknowledgments
 
 - **[cmux](https://cmux.com)** by [@manaflow-ai](https://github.com/manaflow-ai). The whole thing is only possible because cmux exposes a rich CLI/socket API (`list-workspaces`, `new-workspace`, `respawn-pane`, `rename-workspace`). Tip of the hat to the cmux team for building a terminal that's actually automatable.
-- **[Claude Code](https://www.claude.com/product/claude-code)** by [Anthropic](https://www.anthropic.com). The `SessionStart` hook API + the clean JSONL session format made this ~500 lines of Python instead of a weekend project.
+- **[Claude Code](https://www.claude.com/product/claude-code)** by [Anthropic](https://www.anthropic.com). The `SessionStart` hook API + the clean JSONL session format made this ~1000 lines of Python instead of a weekend project.
 - **Built in a single Claude Code session** with Claude Opus 4.7 (1M context). Yes, really. The session was titled _"Restore Claude sessions after Cmux restart"_ — fittingly, the first thing I did after installing this toolkit was use it to resume that exact conversation.
 
 ## License
