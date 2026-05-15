@@ -43,12 +43,45 @@ If the existing workspace already has a Claude session running, the button turns
 
 ![Search — deep transcript match](docs/images/search-deep.png)
 
-Two-stage, no config:
+Three tiers, all opt-in to escalate further:
 
 - **Shallow (instant):** filters the cards you already see against title, kickoff prompt, last prompt, last reply, and cwd. Zero round-trips, debounced 120 ms, with the matched substring highlighted everywhere it appears.
 - **Deep (automatic fallback):** if shallow returns nothing, the dashboard greps the full JSONL bodies server-side and pulls in any session whose transcript contains the query. Each transcript hit renders a highlighted snippet below the usual previews so you can eyeball the match in context. Haystacks cache per-file by mtime, so repeated searches are effectively free.
+- **Semantic (✨ toggle):** flip the **✨ Semantic** pill in the header to also rank by embedding similarity. Lexical results stay first; semantically-related sessions get pulled in alongside them via [Reciprocal Rank Fusion](https://www.cs.uwaterloo.ca/~gvcormac/cormacksigir09-rrf.pdf). Each "no exact word match" hit is labelled with a purple `match · semantic` row so you know why it's there. Off by default; set `CLAUDE_DASHBOARD_EMBED=ollama` (recommended, fully local) or `CLAUDE_DASHBOARD_EMBED=openai` to enable.
 
-In other words: type a phrase you remember saying, type a phrase Claude said back, type a path or a stack-trace fragment — they all work, and you don't have to know up front which one will hit.
+In other words: type a phrase you remember saying, type a phrase Claude said back, type a path or a stack-trace fragment — they all work via lexical search alone. Toggle Semantic on when you remember the *idea* of a session but not the words.
+
+![Search — semantic match](docs/images/search-semantic.png)
+
+### Semantic search setup
+
+Semantic search is opt-in because it needs a local embedding model running. The recipe assumes [Ollama](https://ollama.com), which is the simplest local option:
+
+```bash
+brew install ollama
+brew services start ollama
+ollama pull nomic-embed-text          # 274 MB, one-time download
+
+# Tell the dashboard to use it
+launchctl bootout gui/$(id -u)/com.$USER.claude-dashboard
+plist=~/Library/LaunchAgents/com.$USER.claude-dashboard.plist
+# Open $plist and add inside <key>EnvironmentVariables</key>:
+#   <key>CLAUDE_DASHBOARD_EMBED</key>
+#   <string>ollama</string>
+launchctl bootstrap gui/$(id -u) "$plist"
+
+# Build the embedding cache (~25 s for 500 sessions on M-series)
+claude-dashboard-ctl reindex
+```
+
+The cache lives at `~/.claude/cmux-dashboard-embeddings.sqlite`, keyed by `(provider, model, content_hash)`, so it survives daemon restarts and only re-embeds sessions whose summary text actually changes. Drop it any time with `claude-dashboard-ctl evict-embeddings`.
+
+| Env var                     | Default              | Notes                                                           |
+| --------------------------- | -------------------- | --------------------------------------------------------------- |
+| `CLAUDE_DASHBOARD_EMBED`    | `off`                | `off` / `ollama` / `openai`                                     |
+| `OLLAMA_HOST`               | `http://127.0.0.1:11434` | Ollama daemon URL                                               |
+| `CLAUDE_DASHBOARD_EMBED_MODEL` | `nomic-embed-text` (Ollama) / `text-embedding-3-small` (OpenAI) | Override model name |
+| `OPENAI_API_KEY`            | _(none)_             | Required when `EMBED=openai`                                    |
 
 **Other goodies in the box:**
 
@@ -125,10 +158,12 @@ Reverses everything. Your session data is untouched — it lives in `~/.claude/p
 │                       • respawn-pane + rename-workspace         │
 │  POST /api/hide     → mark a session card hidden                │
 │  POST /api/unhide   → restore a hidden card                     │
+│  POST /api/embed/reindex → (re)build embeddings for all sessions │
+│  POST /api/embed/evict   → drop the embedding cache             │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-Two pieces, no database, no background indexing, no cloud. The registry is a single JSON file. The dashboard reads files on disk, but every layer is mtime-cached: the directory scan is held for a few seconds, parsed sessions stay until their JSONL changes, and deep-search transcripts cache the same way. Cold start parallelizes JSONL parsing across a 16-thread pool. In practice this comfortably handles a few thousand sessions on a laptop — my own corpus is past 500 and a refresh round-trip stays under half a second.
+Two pieces, no database (well — one tiny sqlite file *only* if you opt into semantic search), no background indexing daemon, no cloud. The registry is a single JSON file. The dashboard reads files on disk, but every layer is mtime-cached: the directory scan is held for a few seconds, parsed sessions stay until their JSONL changes, and deep-search transcripts cache the same way. Cold start parallelizes JSONL parsing across a 16-thread pool. Semantic embeddings (when enabled) live in `~/.claude/cmux-dashboard-embeddings.sqlite`, keyed by content hash — same idea, different on-disk shape. In practice this comfortably handles a few thousand sessions on a laptop: my own corpus is past 500 and a refresh round-trip stays under half a second; semantic queries against a fully cached corpus return in ~300 ms (one model call to embed the query plus pure-Python cosine over the stored vectors).
 
 ## Configuration
 
@@ -153,6 +188,7 @@ I'd rather tell you these up front than let you find them during a bad day.
 
 - **[cmux](https://cmux.com)** by [@manaflow-ai](https://github.com/manaflow-ai). The whole thing is only possible because cmux exposes a rich CLI/socket API (`list-workspaces`, `new-workspace`, `respawn-pane`, `rename-workspace`). Tip of the hat to the cmux team for building a terminal that's actually automatable.
 - **[Claude Code](https://www.claude.com/product/claude-code)** by [Anthropic](https://www.anthropic.com). The `SessionStart` hook API + the clean JSONL session format made this ~1000 lines of Python instead of a weekend project.
+- **[Scout](https://github.com/Adobe-AIFoundations/scout)** by Adobe AI Foundations. The semantic-search design here — content-hashed embedding cache, hybrid retrieval, RRF fusion, mtime invalidation — is a small Python echo of Scout's much larger Rust pipeline. The wire format and code are entirely independent (Ollama / OpenAI public APIs, sqlite K/V, vanilla cosine), but the architecture is theirs.
 - **Built in a single Claude Code session** with Claude Opus 4.7 (1M context). Yes, really. The session was titled _"Restore Claude sessions after Cmux restart"_ — fittingly, the first thing I did after installing this toolkit was use it to resume that exact conversation.
 
 ## License

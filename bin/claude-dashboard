@@ -28,11 +28,26 @@ PORT = int(os.environ.get("CLAUDE_DASHBOARD_PORT") or os.environ.get("CMUX_DASHB
 SESSIONS_DIR = os.path.expanduser("~/.claude/projects")
 REGISTRY = os.path.expanduser("~/.claude/cmux-registry.json")
 HIDDEN_STORE = os.path.expanduser("~/.claude/cmux-dashboard-hidden.json")
+EMBED_DB = os.path.expanduser("~/.claude/cmux-dashboard-embeddings.sqlite")
 CMUX = "/Applications/cmux.app/Contents/Resources/bin/cmux"
 HOME = os.path.expanduser("~")
 # Hard cap for runaway safety only; normal corpora up to several thousand render fine
 # thanks to the mtime-keyed parse cache below.
 MAX_SESSIONS = int(os.environ.get("CLAUDE_DASHBOARD_MAX") or "5000")
+# Semantic-search provider. "off" disables semantic entirely (no network calls,
+# no sqlite open). "ollama" talks to a local Ollama daemon at OLLAMA_HOST
+# (default http://127.0.0.1:11434). "openai" hits OpenAI's /v1/embeddings.
+EMBED_PROVIDER = os.environ.get("CLAUDE_DASHBOARD_EMBED", "off").lower()
+# Per-provider knobs. Defaults match the providers' own defaults.
+OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/")
+OLLAMA_EMBED_MODEL = os.environ.get("CLAUDE_DASHBOARD_EMBED_MODEL", "nomic-embed-text")
+OPENAI_EMBED_MODEL = os.environ.get("CLAUDE_DASHBOARD_EMBED_MODEL", "text-embedding-3-small")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+# How many tokens of session-summary text to embed. Just the title + first user
+# prompt + last user prompt + last assistant reply — enough to capture topic
+# without paying for the full transcript. Mirrors Scout's lesson: keep the
+# embedding shape simple and let the lexical retrievers handle precision.
+EMBED_DOC_MAX_CHARS = 4000
 
 # In-memory cache: path -> (mtime_at_parse, parsed_dict).
 # Survives the daemon's lifetime. Each JSONL is parsed once, then re-parsed only
@@ -74,6 +89,245 @@ def _haystack_pool():
                 max_workers=16, thread_name_prefix="haystack"
             )
     return _HAYSTACK_POOL
+
+
+# ---- Semantic search (optional) -------------------------------------------
+#
+# Inspired by the public design of Adobe's Scout (https://github.com/Adobe-AIFoundations/scout):
+# every embedding is content-hashed and cached in a sqlite K/V store, lookups
+# are an array dot-product (no vector DB), and semantic results are fused with
+# the existing lexical retrievers via Reciprocal Rank Fusion. The model and
+# wire format are public providers (Ollama / OpenAI), not Scout's, so this
+# adds zero new pip dependencies and zero new binaries.
+
+_EMBED_CONN = None
+_EMBED_CONN_LOCK = __import__("threading").Lock()
+_EMBED_INDEX = None  # (sess_id_list, mtime_list, vectors_2d) — built on demand
+_EMBED_INDEX_LOCK = __import__("threading").Lock()
+
+
+def _embed_db():
+    """Open (and lazily migrate) the embedding cache. Schema: one row per
+    (provider, model, content_hash) -> raw float32 bytes."""
+    global _EMBED_CONN
+    if _EMBED_CONN is not None:
+        return _EMBED_CONN
+    with _EMBED_CONN_LOCK:
+        if _EMBED_CONN is None:
+            import sqlite3
+            os.makedirs(os.path.dirname(EMBED_DB), exist_ok=True)
+            conn = sqlite3.connect(EMBED_DB, check_same_thread=False)
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS embeddings (
+                    provider TEXT NOT NULL,
+                    model    TEXT NOT NULL,
+                    chash    TEXT NOT NULL,
+                    dim      INTEGER NOT NULL,
+                    vec      BLOB NOT NULL,
+                    PRIMARY KEY (provider, model, chash)
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS sessions (
+                    sess     TEXT PRIMARY KEY,
+                    mtime    REAL NOT NULL,
+                    chash    TEXT NOT NULL
+                )
+            """)
+            conn.commit()
+            _EMBED_CONN = conn
+    return _EMBED_CONN
+
+
+def _embed_doc_for(s):
+    """Build the short summary string we actually send to the embedder. Title
+    first (highest signal), then kickoff prompt, last user prompt, last reply.
+    Capped at EMBED_DOC_MAX_CHARS so a giant transcript can't blow the model
+    context window."""
+    parts = []
+    if s.get("ai_title"):
+        parts.append(s["ai_title"])
+    if s.get("first_user"):
+        parts.append(s["first_user"])
+    if s.get("last_user") and s.get("last_user") != s.get("first_user"):
+        parts.append(s["last_user"])
+    if s.get("last_assistant"):
+        parts.append(s["last_assistant"])
+    text = "\n".join(parts)
+    if len(text) > EMBED_DOC_MAX_CHARS:
+        text = text[:EMBED_DOC_MAX_CHARS]
+    return text
+
+
+def _embed_provider_id():
+    """Return (provider, model) currently configured, or (None, None) if off."""
+    if EMBED_PROVIDER == "ollama":
+        return ("ollama", OLLAMA_EMBED_MODEL)
+    if EMBED_PROVIDER == "openai":
+        return ("openai", OPENAI_EMBED_MODEL)
+    return (None, None)
+
+
+def _embed_call(texts):
+    """Call the configured provider with a list of strings. Returns a list of
+    list[float]. Raises on transport errors so the caller can decide whether
+    to surface a partial result."""
+    import urllib.request, urllib.error
+    provider, model = _embed_provider_id()
+    if not provider:
+        return [None] * len(texts)
+    if provider == "ollama":
+        out = []
+        for t in texts:
+            req = urllib.request.Request(
+                f"{OLLAMA_HOST}/api/embeddings",
+                data=json.dumps({"model": model, "prompt": t}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=30) as r:
+                resp = json.loads(r.read())
+            vec = resp.get("embedding")
+            if not vec:
+                raise RuntimeError(f"ollama returned no embedding: {resp}")
+            out.append(vec)
+        return out
+    if provider == "openai":
+        if not OPENAI_API_KEY:
+            raise RuntimeError("OPENAI_API_KEY not set")
+        req = urllib.request.Request(
+            "https://api.openai.com/v1/embeddings",
+            data=json.dumps({"model": model, "input": texts}).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=60) as r:
+            resp = json.loads(r.read())
+        return [d["embedding"] for d in resp.get("data", [])]
+    raise RuntimeError(f"unknown embed provider: {provider}")
+
+
+def _embed_lookup(provider, model, chash):
+    """Cache lookup. Returns a list[float] or None."""
+    import struct
+    cur = _embed_db().execute(
+        "SELECT dim, vec FROM embeddings WHERE provider=? AND model=? AND chash=?",
+        (provider, model, chash),
+    )
+    row = cur.fetchone()
+    if not row:
+        return None
+    dim, blob = row
+    return list(struct.unpack(f"{dim}f", blob))
+
+
+def _embed_store(provider, model, chash, vec):
+    """Cache write. Stores raw float32 bytes — compact and fast to load."""
+    import struct
+    blob = struct.pack(f"{len(vec)}f", *vec)
+    with _EMBED_CONN_LOCK:
+        _embed_db().execute(
+            "INSERT OR REPLACE INTO embeddings (provider, model, chash, dim, vec) VALUES (?,?,?,?,?)",
+            (provider, model, chash, len(vec), blob),
+        )
+        _embed_db().commit()
+
+
+def _content_hash(text):
+    import hashlib
+    return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
+
+
+def _ensure_session_embeddings(sessions, parallelism=8):
+    """For each session in `sessions`, make sure (provider, model) has an
+    embedding for its current content hash. Uses the parse-cache thread pool
+    to parallelize the network calls. Returns a dict sess_id -> list[float]."""
+    provider, model = _embed_provider_id()
+    if not provider:
+        return {}
+    # Build doc + chash for each session and look up cache
+    todo = []  # list of (sess, doc, chash)
+    out = {}
+    for s in sessions:
+        doc = _embed_doc_for(s)
+        if not doc:
+            continue
+        chash = _content_hash(f"{provider}\n{model}\n{doc}")
+        cached = _embed_lookup(provider, model, chash)
+        if cached:
+            out[s["sess"]] = cached
+        else:
+            todo.append((s["sess"], doc, chash))
+
+    if not todo:
+        return out
+
+    # Network calls in parallel — Ollama serializes per request anyway, but
+    # the wait time per request is dominated by GPU/CPU, so 4–8 in flight is
+    # a pragmatic batch.
+    from concurrent.futures import ThreadPoolExecutor
+    def _one(item):
+        sess, doc, chash = item
+        vecs = _embed_call([doc])
+        return sess, chash, vecs[0]
+
+    with ThreadPoolExecutor(max_workers=parallelism, thread_name_prefix="embed") as ex:
+        for fut in ex.map(_one, todo):
+            sess, chash, vec = fut
+            _embed_store(provider, model, chash, vec)
+            out[sess] = vec
+    return out
+
+
+def _cosine(a, b):
+    """Cosine similarity. Inputs are list[float]; returns a single float in
+    [-1, 1]. No numpy dependency, but explicit element-wise sums keep it fast
+    enough for ~500 sessions × ~768 dims (~50 ms total uncached, free cached
+    via the index below)."""
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot = 0.0
+    na = 0.0
+    nb = 0.0
+    for x, y in zip(a, b):
+        dot += x * y
+        na += x * x
+        nb += y * y
+    if na == 0.0 or nb == 0.0:
+        return 0.0
+    return dot / ((na ** 0.5) * (nb ** 0.5))
+
+
+def _semantic_rank(sessions, query, top_n=50):
+    """Return [(sess_id, score), ...] ranked by cosine similarity to the query.
+    Uses the embedding cache for everything except the query itself."""
+    if not query.strip():
+        return []
+    embeds = _ensure_session_embeddings(sessions)
+    if not embeds:
+        return []
+    qvec = _embed_call([query])[0]
+    scored = []
+    for sess_id, svec in embeds.items():
+        sim = _cosine(qvec, svec)
+        scored.append((sess_id, sim))
+    scored.sort(key=lambda t: t[1], reverse=True)
+    return scored[:top_n]
+
+
+def _rrf_fuse(rankings, k=60):
+    """Reciprocal Rank Fusion. `rankings` is a list of ranked-id lists, one
+    per retriever. Returns dict sess_id -> fused_score. The classic Cormack
+    et al. formula: score(d) = sum_r 1 / (k + rank_r(d)). k=60 is the
+    standard default — small enough that top-1 dominates, large enough that
+    middle ranks still contribute."""
+    fused = {}
+    for ranking in rankings:
+        for rank, sess_id in enumerate(ranking, start=1):
+            fused[sess_id] = fused.get(sess_id, 0.0) + 1.0 / (k + rank)
+    return fused
 
 
 def _extract_user_text(j):
@@ -478,7 +732,7 @@ def _match_deep(s, q_lower):
     return _snippet_from_file(path, q_lower) or "(match)"
 
 
-def build_payload(include_hidden=False, query="", deep=False):
+def build_payload(include_hidden=False, query="", deep=False, semantic=False):
     sessions = collect_sessions()
     registry = load_registry()
     ws_live = live_workspaces()
@@ -488,6 +742,21 @@ def build_payload(include_hidden=False, query="", deep=False):
     if q_lower and deep:
         # Parallel warm-up so 2000+ cold file reads don't serialize.
         _warm_haystacks([s["path"] for s in sessions if "path" in s])
+
+    # Semantic-search retriever runs alongside the lexical ones. We compute
+    # rankings (lists of session ids) for each retriever separately and then
+    # fuse with RRF. If semantic is requested but the provider is off or the
+    # call fails, we degrade to lexical-only without surfacing an error.
+    semantic_ranks = []
+    semantic_error = ""
+    semantic_used = False
+    if q_lower and semantic and EMBED_PROVIDER != "off":
+        try:
+            scored = _semantic_rank(sessions, query, top_n=50)
+            semantic_ranks = [sess for sess, _ in scored]
+            semantic_used = bool(semantic_ranks)
+        except Exception as e:
+            semantic_error = str(e)
 
     # session_id -> (workspace_id, workspace_title)
     sess_to_ws = {}
@@ -514,9 +783,18 @@ def build_payload(include_hidden=False, query="", deep=False):
         return int(m.group()) if m else 9999
     workspaces_list.sort(key=lambda w: (not w["selected"], _ref_num(w)))
 
+    # First pass: per-session lexical decision. We capture which retriever
+    # contributed each candidate so RRF can fuse multiple rankings later.
     out = []
     hidden_count = 0
     deep_hits = 0
+    shallow_rank = []     # ordered: matches before non-matches doesn't apply
+                          # (we only emit matches), but we keep insertion order
+                          # which is mtime-newest-first thanks to collect_sessions.
+    deep_rank = []
+    semantic_only_added = set()  # session ids added via semantic that weren't lexical hits
+
+    by_sess = {}
     for s in sessions:
         is_hidden = s["sess"] in hidden_ids
         if is_hidden:
@@ -526,42 +804,101 @@ def build_payload(include_hidden=False, query="", deep=False):
 
         snippet = ""
         matched_field = ""
-        if q_lower:
+        kept = False
+
+        if not q_lower:
+            kept = True
+        else:
             shallow = _match_shallow(s, q_lower)
             if shallow:
                 matched_field = shallow[0]
+                shallow_rank.append(s["sess"])
+                kept = True
             elif deep:
                 snippet = _match_deep(s, q_lower) or ""
                 if snippet:
                     matched_field = "transcript"
                     deep_hits += 1
-                else:
-                    continue
-            else:
-                continue
+                    deep_rank.append(s["sess"])
+                    kept = True
 
-        title = s["ai_title"] or (s["first_user"][:60] if s["first_user"] else s["sess"][:8])
-        title = title[:90]
-        ws_match = sess_to_ws.get(s["sess"])
-        out.append({
-            "sess": s["sess"],
-            "title": title,
-            "cwd": s["cwd"],
-            "cwd_short": shorten_cwd(s["cwd"] or "(unknown)"),
-            "cwd_exists": bool(s["cwd"]) and os.path.isdir(s["cwd"]),
-            "age": humantime(s["mtime"]),
-            "age_seconds": int(datetime.datetime.now().timestamp() - s["mtime"]),
-            "n_msgs": s["n_msgs"],
-            "kickoff": s["first_user"][:220],
-            "latest_user": s["last_user"][:220],
-            "latest_assistant": s["last_assistant"][:220],
-            "active": s["sess"] in active_ids,
-            "workspace_id": ws_match[0] if ws_match else "",
-            "workspace_title": ws_match[1] if ws_match else "",
-            "hidden": is_hidden,
-            "matched_field": matched_field,
-            "snippet": snippet,
-        })
+        # Even if no lexical retriever matched, we may still keep the row
+        # later if semantic put it in the top-N.
+        if kept:
+            title = s["ai_title"] or (s["first_user"][:60] if s["first_user"] else s["sess"][:8])
+            title = title[:90]
+            ws_match = sess_to_ws.get(s["sess"])
+            row = {
+                "sess": s["sess"],
+                "title": title,
+                "cwd": s["cwd"],
+                "cwd_short": shorten_cwd(s["cwd"] or "(unknown)"),
+                "cwd_exists": bool(s["cwd"]) and os.path.isdir(s["cwd"]),
+                "age": humantime(s["mtime"]),
+                "age_seconds": int(datetime.datetime.now().timestamp() - s["mtime"]),
+                "n_msgs": s["n_msgs"],
+                "kickoff": s["first_user"][:220],
+                "latest_user": s["last_user"][:220],
+                "latest_assistant": s["last_assistant"][:220],
+                "active": s["sess"] in active_ids,
+                "workspace_id": ws_match[0] if ws_match else "",
+                "workspace_title": ws_match[1] if ws_match else "",
+                "hidden": is_hidden,
+                "matched_field": matched_field,
+                "snippet": snippet,
+            }
+            out.append(row)
+            by_sess[s["sess"]] = row
+
+    # Semantic adds: any top-ranked session that wasn't already a lexical hit
+    # gets pulled in with matched_field="semantic" so the UI can label it.
+    if semantic_used and q_lower:
+        for sess_id in semantic_ranks:
+            if sess_id in by_sess:
+                continue
+            # Find the corresponding session payload
+            src = next((x for x in sessions if x["sess"] == sess_id), None)
+            if not src:
+                continue
+            if not include_hidden and src["sess"] in hidden_ids:
+                continue
+            title = src["ai_title"] or (src["first_user"][:60] if src["first_user"] else src["sess"][:8])
+            title = title[:90]
+            ws_match = sess_to_ws.get(src["sess"])
+            row = {
+                "sess": src["sess"],
+                "title": title,
+                "cwd": src["cwd"],
+                "cwd_short": shorten_cwd(src["cwd"] or "(unknown)"),
+                "cwd_exists": bool(src["cwd"]) and os.path.isdir(src["cwd"]),
+                "age": humantime(src["mtime"]),
+                "age_seconds": int(datetime.datetime.now().timestamp() - src["mtime"]),
+                "n_msgs": src["n_msgs"],
+                "kickoff": src["first_user"][:220],
+                "latest_user": src["last_user"][:220],
+                "latest_assistant": src["last_assistant"][:220],
+                "active": src["sess"] in active_ids,
+                "workspace_id": ws_match[0] if ws_match else "",
+                "workspace_title": ws_match[1] if ws_match else "",
+                "hidden": src["sess"] in hidden_ids,
+                "matched_field": "semantic",
+                "snippet": "",
+            }
+            out.append(row)
+            by_sess[src["sess"]] = row
+            semantic_only_added.add(src["sess"])
+
+    # Fuse rankings with RRF when a query is active and we have at least one
+    # ranked retriever. With only a single retriever (lexical-only mode) we
+    # leave the existing mtime-newest order alone — RRF on a single ranking
+    # would just reproduce that ranking anyway.
+    if q_lower and (semantic_used or len(shallow_rank) + len(deep_rank) > 1):
+        rankings = [r for r in (shallow_rank, deep_rank, semantic_ranks) if r]
+        fused = _rrf_fuse(rankings)
+        # Sort `out` by fused score desc; sessions absent from fused dict go last
+        # in their original (mtime-newest) order.
+        out.sort(key=lambda row: (-fused.get(row["sess"], 0.0), row.get("age_seconds", 0)))
+
     return {
         "generated_at": datetime.datetime.now().isoformat(timespec="seconds"),
         "sessions": out,
@@ -571,6 +908,11 @@ def build_payload(include_hidden=False, query="", deep=False):
         "query": query,
         "deep": deep,
         "deep_hits": deep_hits,
+        "semantic": semantic,
+        "semantic_used": semantic_used,
+        "semantic_provider": EMBED_PROVIDER if EMBED_PROVIDER != "off" else "",
+        "semantic_error": semantic_error,
+        "semantic_only_count": len(semantic_only_added),
     }
 
 
@@ -738,6 +1080,28 @@ DASHBOARD_HTML = r"""<!doctype html>
   header .search.has-query .clear { display: flex; }
   header .search.deep input { border-color: var(--accent-dim); }
   header .search.searching input { border-color: var(--accent); }
+  header .semantic-toggle {
+    font: inherit; font-size: 12px;
+    padding: 4px 10px; margin-left: 8px;
+    border-radius: 999px; border: 1px solid var(--border);
+    background: transparent; color: var(--fg-muted);
+    cursor: pointer; transition: all 120ms; white-space: nowrap;
+  }
+  header .semantic-toggle:hover { color: var(--fg); border-color: var(--accent-dim); }
+  header .semantic-toggle.active {
+    color: var(--accent); border-color: var(--accent);
+    background: rgba(122,162,247,0.08);
+  }
+  header .semantic-toggle[disabled] {
+    opacity: 0.45; cursor: not-allowed;
+  }
+  .card.semantic-only {
+    border-left: 3px solid #c084fc;
+  }
+  .card .match-hit.semantic {
+    background: rgba(192, 132, 252, 0.07);
+    border-left-color: #c084fc;
+  }
   header .meta { color: var(--fg-muted); font-size: 13px; margin-left: auto; display: flex; align-items: center; gap: 16px; }
   .card .match-hit {
     font-size: 12px; color: var(--fg-muted);
@@ -899,6 +1263,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     <input id="search-input" type="search" placeholder="Search titles, prompts, replies…" autocomplete="off" spellcheck="false">
     <button class="clear" id="search-clear" title="Clear (Esc)">×</button>
   </div>
+  <button class="semantic-toggle" id="semantic-toggle" title="Also rank by semantic similarity (requires a configured embedding provider)">✨ Semantic</button>
   <div class="meta">
     <button class="hidden-toggle" id="hidden-toggle" style="display:none;">Show hidden (<span id="hidden-count">0</span>)</button>
     <span id="status-line"><span id="session-count">—</span> sessions · last refresh <span id="refresh-ts">—</span></span>
@@ -918,6 +1283,7 @@ const toast = document.getElementById('toast');
 const searchWrap = document.getElementById('search');
 const searchInput = document.getElementById('search-input');
 const searchClear = document.getElementById('search-clear');
+const semanticToggle = document.getElementById('semantic-toggle');
 
 function showToast(msg, kind) {
   toast.textContent = msg;
@@ -944,6 +1310,12 @@ let deepQueryInFlight = '';
 // The query we've already attempted a deep search for (whether it returned
 // hits or not). Prevents re-firing the server roundtrip on each keystroke.
 let deepQueryAttempted = '';
+// Semantic-search opt-in. Persisted in localStorage so it survives refreshes.
+let semanticEnabled = (() => {
+  try { return localStorage.getItem('cs.semantic') === '1'; } catch (e) { return false; }
+})();
+// Latest semantic query we've requested — used to skip stale responses.
+let semanticQueryInFlight = '';
 
 function renderCards(data) {
   tsEl.textContent = new Date().toLocaleTimeString();
@@ -964,6 +1336,17 @@ function renderCards(data) {
   // refresh too. Matches title, kickoff, last prompt, last reply, and cwd.
   const q = searchQuery;
   const showing = [];
+  // When semantic ranking ran, the server already returned a fused ordering
+  // that includes semantic-only hits — trust it; just attach any snippets we
+  // collected from a separate deep call.
+  if (q && data.semantic_used) {
+    for (const s of data.sessions) {
+      const deep = deepHits.get(s.sess);
+      showing.push(deep
+        ? {...s, _deepSnippet: deep.snippet, _matchedField: deep.matched_field || s.matched_field}
+        : {...s});
+    }
+  } else {
   for (const s of data.sessions) {
     if (!q) { showing.push(s); continue; }
     const hay = [
@@ -982,6 +1365,7 @@ function renderCards(data) {
     if (deep) {
       showing.push({...s, _deepSnippet: deep.snippet, _matchedField: deep.matched_field});
     }
+  }
   }
   countEl.textContent = showing.length + (q ? ' / ' + data.sessions.length : '');
 
@@ -1022,7 +1406,11 @@ function renderCards(data) {
   const frag = document.createDocumentFragment();
   for (const s of showing) {
     const card = document.createElement('div');
-    card.className = 'card' + (s.active ? ' active' : '') + (s.hidden ? ' is-hidden' : '');
+    const semanticOnly = s.matched_field === 'semantic' && !s._matchedShallow && !s._deepSnippet;
+    card.className = 'card'
+      + (s.active ? ' active' : '')
+      + (s.hidden ? ' is-hidden' : '')
+      + (semanticOnly ? ' semantic-only' : '');
     // Hide (×) button — only for non-hidden cards; hidden cards get a Restore button in actions row
     if (!s.hidden) {
       const hideBtn = document.createElement('button');
@@ -1091,6 +1479,16 @@ function renderCards(data) {
       const hit = document.createElement('div');
       hit.className = 'match-hit';
       hit.innerHTML = '<span class="label">match · transcript</span>' + hilite(s._deepSnippet);
+      preview.appendChild(hit);
+    }
+    // Semantic-only hit: no lexical match anywhere, but the embedding
+    // ranked it close to the query. Label it explicitly so the user
+    // knows why it's here.
+    if (semanticOnly) {
+      const hit = document.createElement('div');
+      hit.className = 'match-hit semantic';
+      hit.innerHTML = '<span class="label">match · semantic</span>'
+        + 'Embedding similarity to your query — no exact word match.';
       preview.appendChild(hit);
     }
     card.appendChild(preview);
@@ -1225,8 +1623,15 @@ function onSearchInput() {
   deepQueryInFlight = '';
   clearTimeout(searchDebounce);
   searchDebounce = setTimeout(() => {
-    if (lastPayload) renderCards(lastPayload);
-  }, 120);
+    // Semantic mode needs a server roundtrip to recompute the ranking; pure
+    // lexical mode can re-render the cached payload locally for instant
+    // feedback while the next 10s poll catches any new sessions.
+    if (semanticEnabled && searchQuery) {
+      refresh();
+    } else if (lastPayload) {
+      renderCards(lastPayload);
+    }
+  }, 250);
 }
 searchInput.addEventListener('input', onSearchInput);
 searchInput.addEventListener('keydown', (e) => {
@@ -1241,6 +1646,29 @@ searchClear.addEventListener('click', () => {
   onSearchInput();
   searchInput.focus();
 });
+
+// Semantic toggle. Persists in localStorage. Triggers a refresh so the
+// server applies / removes semantic ranking immediately. Disabled state is
+// driven from the latest payload (data.semantic_provider).
+function applySemanticState() {
+  semanticToggle.classList.toggle('active', semanticEnabled);
+  const provider = (lastPayload && lastPayload.semantic_provider) || '';
+  if (!provider) {
+    semanticToggle.disabled = true;
+    semanticToggle.title = 'Semantic search is off. Set CLAUDE_DASHBOARD_EMBED=ollama (or openai) in the daemon environment to enable it.';
+  } else {
+    semanticToggle.disabled = false;
+    semanticToggle.title = 'Semantic ranking via ' + provider + '. Click to toggle.';
+  }
+}
+semanticToggle.addEventListener('click', () => {
+  if (semanticToggle.disabled) return;
+  semanticEnabled = !semanticEnabled;
+  try { localStorage.setItem('cs.semantic', semanticEnabled ? '1' : '0'); } catch (e) {}
+  applySemanticState();
+  refresh();
+});
+applySemanticState();
 // ⌘K / Ctrl+K / "/" focuses the search box.
 document.addEventListener('keydown', (e) => {
   if (document.activeElement === searchInput) return;
@@ -1310,11 +1738,31 @@ async function refresh() {
   pill.classList.add('refreshing');
   pillLabel.textContent = 'Refreshing…';
   try {
-    const url = '/api/sessions' + (showHidden ? '?include_hidden=1' : '');
+    // Only ask for semantic ranking when the user has both the toggle on and
+    // a non-empty query — semantic without a query is meaningless and
+    // wastes a model round-trip on every poll.
+    const params = [];
+    if (showHidden) params.push('include_hidden=1');
+    if (semanticEnabled && searchQuery) {
+      params.push('q=' + encodeURIComponent(searchQuery));
+      params.push('deep=1');
+      params.push('semantic=1');
+      semanticQueryInFlight = searchQuery;
+    }
+    const url = '/api/sessions' + (params.length ? '?' + params.join('&') : '');
     const r = await fetch(url);
     const data = await r.json();
+    // Stale-response guard: only apply if user hasn't kept typing past us.
+    if (semanticEnabled && searchQuery
+        && data.query && data.query.toLowerCase() !== searchQuery) {
+      return;
+    }
     lastPayload = data;
+    if (data.semantic_error) {
+      showToast('Semantic backend error: ' + data.semantic_error, 'error');
+    }
     renderCards(data);
+    applySemanticState();
     lastRefreshAt = Date.now();
   } catch (e) {
     console.error(e);
@@ -1434,7 +1882,8 @@ class Handler(BaseHTTPRequestHandler):
                 include_hidden = qs.get("include_hidden", ["0"])[0] in ("1", "true", "yes")
                 query = qs.get("q", [""])[0]
                 deep = qs.get("deep", ["0"])[0] in ("1", "true", "yes")
-                payload = build_payload(include_hidden=include_hidden, query=query, deep=deep)
+                semantic = qs.get("semantic", ["0"])[0] in ("1", "true", "yes")
+                payload = build_payload(include_hidden=include_hidden, query=query, deep=deep, semantic=semantic)
                 self._send_json(200, payload)
             except Exception as e:
                 traceback.print_exc()
@@ -1446,7 +1895,10 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(404, {"error": "not found"})
 
     def do_POST(self):
-        if self.path not in ("/api/resume", "/api/hide", "/api/unhide"):
+        if self.path not in (
+            "/api/resume", "/api/hide", "/api/unhide",
+            "/api/embed/reindex", "/api/embed/evict",
+        ):
             self._send_json(404, {"error": "not found"})
             return
         length = int(self.headers.get("Content-Length") or 0)
@@ -1473,6 +1925,39 @@ class Handler(BaseHTTPRequestHandler):
                 return
             count = unhide_session(sid)
             self._send_json(200, {"hidden_count": count})
+            return
+
+        if self.path == "/api/embed/reindex":
+            if EMBED_PROVIDER == "off":
+                self._send_json(400, {"error": "no embed provider configured"})
+                return
+            try:
+                sessions = collect_sessions()
+                t0 = time.time()
+                vecs = _ensure_session_embeddings(sessions, parallelism=8)
+                self._send_json(200, {
+                    "provider": EMBED_PROVIDER,
+                    "sessions_total": len(sessions),
+                    "embeddings": len(vecs),
+                    "elapsed_seconds": round(time.time() - t0, 2),
+                })
+            except Exception as e:
+                traceback.print_exc()
+                self._send_json(500, {"error": str(e)})
+            return
+
+        if self.path == "/api/embed/evict":
+            try:
+                conn = _embed_db()
+                with _EMBED_CONN_LOCK:
+                    cur = conn.execute("SELECT COUNT(*) FROM embeddings")
+                    before = cur.fetchone()[0]
+                    conn.execute("DELETE FROM embeddings")
+                    conn.commit()
+                self._send_json(200, {"evicted": before})
+            except Exception as e:
+                traceback.print_exc()
+                self._send_json(500, {"error": str(e)})
             return
 
         # /api/resume

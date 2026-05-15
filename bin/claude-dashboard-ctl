@@ -2,14 +2,18 @@
 # claude-dashboard-ctl — manage the launchd-backed Claude sessions dashboard daemon.
 #
 # Subcommands:
-#   install   load the LaunchAgent (also starts it)
-#   uninstall unload the LaunchAgent
-#   start     start if not running
-#   stop      stop
-#   restart   stop then start
-#   status    show status + last few log lines
-#   open      open http://127.0.0.1:<port> in browser (starts if needed)
-#   logs      tail -f the stderr log
+#   install            load the LaunchAgent (also starts it)
+#   uninstall          unload the LaunchAgent
+#   start              start if not running
+#   stop               stop
+#   restart            stop then start
+#   status             show status + last few log lines
+#   open               open http://127.0.0.1:<port> in browser (starts if needed)
+#   logs               tail -f the stderr log
+#   reindex            (re)build semantic embeddings for every session via
+#                      the configured provider (CLAUDE_DASHBOARD_EMBED)
+#   evict-embeddings   drop the semantic-embedding cache (next reindex
+#                      rebuilds from scratch)
 
 set -euo pipefail
 
@@ -77,8 +81,25 @@ case "$cmd" in
     echo "Tailing $STDERR_LOG (Ctrl-C to stop)"
     tail -f "$STDERR_LOG" 2>/dev/null
     ;;
+  reindex)
+    if ! curl -sf "${URL}healthz" > /dev/null; then
+      echo "Daemon not responding at $URL — start it first ($0 start)" >&2
+      exit 1
+    fi
+    echo "Reindexing semantic embeddings (this may take a minute on first run)…"
+    curl -sS -X POST "${URL}api/embed/reindex"
+    echo
+    ;;
+  evict-embeddings)
+    if ! curl -sf "${URL}healthz" > /dev/null; then
+      echo "Daemon not responding at $URL — start it first ($0 start)" >&2
+      exit 1
+    fi
+    curl -sS -X POST "${URL}api/embed/evict"
+    echo
+    ;;
   *)
-    echo "Usage: $0 {install|uninstall|start|stop|restart|status|open|logs}"
+    echo "Usage: $0 {install|uninstall|start|stop|restart|status|open|logs|reindex|evict-embeddings}"
     exit 2
     ;;
 esac
