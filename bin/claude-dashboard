@@ -187,11 +187,17 @@ def _embed_db():
 
 
 def _embed_doc_for(s):
-    """Build the short summary string we actually send to the embedder. Title
-    first (highest signal), then kickoff prompt, last user prompt, last reply.
-    Capped at EMBED_DOC_MAX_CHARS so a giant transcript can't blow the model
-    context window."""
+    """Build the short summary string we actually send to the embedder. The
+    LLM summary, when one is cached, goes first — it's the highest-signal
+    short text we have ('what got done' in 2-3 sentences). Title and the
+    raw turns follow as fallback context. Capped at EMBED_DOC_MAX_CHARS so a
+    giant transcript can't blow the model context window. Changing this
+    function's output invalidates the embedding cache for affected sessions
+    (mtime-keyed content hash); the warmer rebuilds those automatically."""
     parts = []
+    summary = _summary_lookup_for(s)
+    if summary:
+        parts.append(summary)
     if s.get("ai_title"):
         parts.append(s["ai_title"])
     if s.get("first_user"):
@@ -204,6 +210,19 @@ def _embed_doc_for(s):
     if len(text) > EMBED_DOC_MAX_CHARS:
         text = text[:EMBED_DOC_MAX_CHARS]
     return text
+
+
+def _summary_lookup_for(s):
+    """Cheap summary cache lookup for one session. Read-only — never blocks on
+    LLM calls. Returns '' if there's no provider, no parsed input, or no
+    cached row."""
+    chash = _summary_chash_cheap(s)
+    if not chash:
+        return ""
+    provider, model = _summary_provider_id()
+    if not provider:
+        return ""
+    return _summary_lookup(provider, model, chash) or ""
 
 
 def _embed_provider_id():
@@ -1201,10 +1220,16 @@ def _snippet_around(full, idx, q_len, width=140):
     return snippet
 
 
-def _match_shallow(s, q_lower):
+def _match_shallow(s, q_lower, summary=""):
     """Return (field_name, idx_in_preview) or None. Checks the cheap preview
     fields that the client already has — used server-side for consistent
-    behavior when a query is supplied."""
+    behavior when a query is supplied. Includes the LLM summary when one is
+    cached: a phrase that only the summary captures (e.g. "race condition"
+    in a session whose user prompt only said 'fix this please') still hits."""
+    if summary:
+        idx = summary.lower().find(q_lower)
+        if idx >= 0:
+            return "summary", idx
     for field in ("ai_title", "first_user", "last_user", "last_assistant", "cwd"):
         v = s.get(field) or ""
         if not v:
@@ -1348,7 +1373,7 @@ def build_payload(include_hidden=False, query="", deep=False):
         if not q_lower:
             kept = True
         else:
-            shallow = _match_shallow(s, q_lower)
+            shallow = _match_shallow(s, q_lower, summary_map.get(s["sess"], ""))
             if shallow:
                 matched_field = shallow[0]
                 shallow_rank.append(s["sess"])
@@ -1982,6 +2007,7 @@ function renderCards(data) {
     if (!q) { showing.push(s); continue; }
     const hay = [
       s.title || '',
+      s.summary || '',
       s.kickoff || '',
       s.latest_user || '',
       s.latest_assistant || '',
