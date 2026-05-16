@@ -1,12 +1,10 @@
 # claude-sessions
 
-**Your 17 Claude Code sessions are not dead. They just look dead.**
+**A browseable history of every Claude Code session you've ever run.**
 
-When [cmux](https://cmux.com) quits, every Claude Code pane dies with it. You relaunch and find yourself staring at an empty sidebar — wondering which session was the bug hunt, which was the refactor, which was the one you were two minutes from finishing.
+After a few weeks of heavy use, you've got hundreds of Claude Code sessions on disk. Which one was the bug hunt? Which was the refactor? Which one had that prompt you want to copy? `claude --resume` only surfaces the most-recent session per directory, which is hilarious if you run five sessions in the same repo at once (hi, monorepo people), and there's no way to search across them.
 
-`claude --resume` won't save you either. It only grabs the most-recent session per directory, which is hilarious if you run five sessions in the same repo at once (hi, monorepo people).
-
-This repo is the small toolkit I built so that never happens again.
+This repo is the small toolkit I built so I can actually see what I've worked on — and jump back into any of it with one click.
 
 [![macOS](https://img.shields.io/badge/macOS-12%2B-black?logo=apple)](https://www.apple.com/macos/)
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue?logo=python&logoColor=white)](https://www.python.org/)
@@ -224,7 +222,6 @@ I'd rather tell you these up front than let you find them during a bad day.
 
 - **[cmux](https://cmux.com)** by [@manaflow-ai](https://github.com/manaflow-ai). The whole thing is only possible because cmux exposes a rich CLI/socket API (`list-workspaces`, `new-workspace`, `respawn-pane`, `rename-workspace`). Tip of the hat to the cmux team for building a terminal that's actually automatable.
 - **[Claude Code](https://www.claude.com/product/claude-code)** by [Anthropic](https://www.anthropic.com). The `SessionStart` hook API + the clean JSONL session format made this ~1000 lines of Python instead of a weekend project.
-- **[Scout](https://github.com/Adobe-AIFoundations/scout)** by Adobe AI Foundations. The semantic-search design here — content-hashed embedding cache, hybrid retrieval, RRF fusion, mtime invalidation — is a small Python echo of Scout's much larger Rust pipeline. The wire format and code are entirely independent (Ollama / OpenAI public APIs, sqlite K/V, vanilla cosine), but the architecture is theirs.
 - **Built in a single Claude Code session** with Claude Opus 4.7 (1M context). Yes, really. The session was titled _"Restore Claude sessions after Cmux restart"_ — fittingly, the first thing I did after installing this toolkit was use it to resume that exact conversation.
 
 ## Changelog

@@ -11,3 +11,6 @@ launchd/com.*.claude-dashboard.plist
 # Python bytecode (there shouldn't be any, but just in case)
 __pycache__/
 *.pyc
+
+# Playwright MCP scratch
+.playwright-mcp/
